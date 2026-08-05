@@ -1,11 +1,32 @@
-import React from 'react';
-import { Volume2, Sparkles, Cpu, CheckCircle2, AlertCircle } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Volume2, Sparkles, Cpu, CheckCircle2, AlertCircle, Download } from 'lucide-react';
+
+interface InstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
+}
 
 interface HeaderProps {
   serverStatus: 'connected' | 'checking' | 'error';
 }
 
 export const Header: React.FC<HeaderProps> = ({ serverStatus }) => {
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+
+  useEffect(() => {
+    const handleInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    const handleInstalled = () => setInstallPrompt(null);
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
+
   return (
     <header className="border-b border-slate-200 bg-white/80 backdrop-blur-md sticky top-0 z-30">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -23,13 +44,26 @@ export const Header: React.FC<HeaderProps> = ({ serverStatus }) => {
               </span>
             </div>
             <p className="text-xs text-slate-500 hidden sm:block">
-              Generación de locución ultranatural multi-voz y síntesis en tiempo real
+              Generación de locuciones naturales con una o dos voces
             </p>
           </div>
         </div>
 
         {/* Status Indicator */}
         <div className="flex items-center space-x-3">
+          {installPrompt && (
+            <button
+              type="button"
+              onClick={async () => {
+                await installPrompt.prompt();
+                const choice = await installPrompt.userChoice;
+                if (choice.outcome === 'accepted') setInstallPrompt(null);
+              }}
+              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100"
+            >
+              <Download className="w-3.5 h-3.5" /> Instalar
+            </button>
+          )}
           <div className="flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-medium border bg-slate-50 text-slate-700 border-slate-200">
             <Cpu className="w-3.5 h-3.5 text-slate-500" />
             <span className="hidden md:inline">Modelo:</span>

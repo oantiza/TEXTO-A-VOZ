@@ -121,15 +121,124 @@ LOCUCIÓN DEL VÍDEO · voz femenina, español de España · duración 03:00
   [02:54] crece donde le das tiempo.
   [02:56] Gracias por acompañarnos en Dinero con Criterio.`;
 
+interface SubtitleCue {
+  startSec: number;
+  endSec: number;
+  text: string;
+}
+
+function secondsToSubtitleTime(totalSeconds: number, decimalSeparator: ',' | '.'): string {
+  const totalMilliseconds = Math.round(Math.max(0, totalSeconds) * 1000);
+  const hours = Math.floor(totalMilliseconds / 3_600_000);
+  const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
+  const seconds = Math.floor((totalMilliseconds % 60_000) / 1000);
+  const milliseconds = totalMilliseconds % 1000;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds
+    .toString()
+    .padStart(2, '0')}${decimalSeparator}${milliseconds.toString().padStart(3, '0')}`;
+}
+
+export function scriptToSrt(script: ParsedScript): string {
+  return script.chapters
+    .flatMap((chapter) => chapter.lines)
+    .map(
+      (line, index) =>
+        `${index + 1}\n${secondsToSubtitleTime(line.startSec, ',')} --> ${secondsToSubtitleTime(
+          line.endSec,
+          ','
+        )}\n${line.text}`
+    )
+    .join('\n\n');
+}
+
+export function scriptToVtt(script: ParsedScript): string {
+  const cues = script.chapters
+    .flatMap((chapter) => chapter.lines)
+    .map(
+      (line) =>
+        `${secondsToSubtitleTime(line.startSec, '.')} --> ${secondsToSubtitleTime(line.endSec, '.')}\n${line.text}`
+    )
+    .join('\n\n');
+  return `WEBVTT\n\n${cues}`;
+}
+
+function subtitleTimeToSeconds(value: string): number {
+  const parts = value.replace(',', '.').split(':').map(Number);
+  if (parts.some((part) => !Number.isFinite(part))) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return 0;
+}
+
+/** Parse standard SRT and WebVTT timing blocks, including multi-line captions. */
+export function parseSubtitleCues(scriptText: string): SubtitleCue[] {
+  const lines = scriptText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+  const timingPattern = /^((?:\d{1,2}:)?\d{2}:\d{2}[,.]\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2}[,.]\d{3})(?:\s+.*)?$/;
+  const cues: SubtitleCue[] = [];
+
+  for (let index = 0; index < lines.length; index++) {
+    const timing = lines[index].trim().match(timingPattern);
+    if (!timing) continue;
+
+    const startSec = subtitleTimeToSeconds(timing[1]);
+    const endSec = subtitleTimeToSeconds(timing[2]);
+    const captionLines: string[] = [];
+
+    for (index += 1; index < lines.length && lines[index].trim() !== ''; index++) {
+      if (timingPattern.test(lines[index].trim())) {
+        index -= 1;
+        break;
+      }
+      captionLines.push(lines[index].trim());
+    }
+
+    const text = captionLines
+      .join(' ')
+      .replace(/<\d{2}:\d{2}(?::\d{2})?[,.]\d{3}>/g, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (text && endSec > startSec) cues.push({ startSec, endSec, text });
+  }
+
+  return cues;
+}
+
 /**
  * Parses script text containing timestamps like [00:00], [01:26] and chapter section headers.
  */
 export function parseVideoScript(scriptText: string): ParsedScript {
+  const subtitleCues = parseSubtitleCues(scriptText);
+  if (subtitleCues.length > 0) {
+    const totalDurationSec = Math.max(...subtitleCues.map((cue) => cue.endSec));
+    const lines: ScriptLine[] = subtitleCues.map((cue, index) => ({
+      id: `line_${index + 1}`,
+      startSec: cue.startSec,
+      endSec: cue.endSec,
+      targetDurationSec: Math.max(0.1, cue.endSec - cue.startSec),
+      text: cue.text,
+    }));
+    return {
+      title: 'Guion importado desde subtítulos',
+      voiceInfo: 'Español de España',
+      totalDurationSec,
+      chapters: [
+        {
+          id: 'chap_1',
+          title: 'Subtítulos importados',
+          timeRange: `00:00 – ${secondsToTimeString(totalDurationSec)}`,
+          lines,
+        },
+      ],
+    };
+  }
+
   const linesRaw = scriptText.split('\n');
 
   let title = 'Guión de Locución para Vídeo';
   let voiceInfo = 'Voz femenina, Español de España';
-  let totalDurationSec = 180; // 03:00 default
+  let totalDurationSec = 0;
 
   const chapters: ScriptChapter[] = [];
   let currentChapter: ScriptChapter | null = null;
@@ -294,7 +403,7 @@ export function parseVideoScript(scriptText: string): ParsedScript {
 export async function combineScriptAudioSegments(
   lines: ScriptLine[],
   totalDurationSec: number
-): Promise<{ masterBlobUrl: string; totalBytes: number }> {
+): Promise<{ masterBlob: Blob; masterBlobUrl: string; totalBytes: number }> {
   const sampleRate = 24000;
   const numChannels = 1;
   const bitsPerSample = 16;
@@ -360,5 +469,5 @@ export async function combineScriptAudioSegments(
   const blob = new Blob([fullWavBytes], { type: 'audio/wav' });
   const masterBlobUrl = URL.createObjectURL(blob);
 
-  return { masterBlobUrl, totalBytes: fullWavBytes.length };
+  return { masterBlob: blob, masterBlobUrl, totalBytes: fullWavBytes.length };
 }

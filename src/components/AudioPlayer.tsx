@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { GeneratedAudioItem } from '../types';
 import { formatTime } from '../utils/audio';
+import { wavBlobToMp3Blob } from '../utils/audio';
 import {
   Play,
   Pause,
@@ -11,6 +12,7 @@ import {
   Sparkles,
   Share2,
   Check,
+  Loader2,
 } from 'lucide-react';
 
 interface AudioPlayerProps {
@@ -26,6 +28,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({ currentAudio }) => {
   const [playbackRate, setPlaybackRate] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [isConvertingMp3, setIsConvertingMp3] = useState(false);
 
   useEffect(() => {
     if (currentAudio) {
@@ -144,14 +147,30 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({ currentAudio }) => {
     }
   };
 
-  const handleDownload = () => {
-    if (!currentAudio.audioUrl) return;
+  const triggerDownload = (url: string, extension: 'wav' | 'mp3') => {
     const a = document.createElement('a');
-    a.href = currentAudio.audioUrl;
-    a.download = `locucion-${currentAudio.voice.toLowerCase()}-${Date.now()}.wav`;
+    a.href = url;
+    a.download = `locucion-${currentAudio.voice.toLowerCase()}-${Date.now()}.${extension}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+  };
+
+  const handleDownloadWav = () => {
+    if (currentAudio.audioUrl) triggerDownload(currentAudio.audioUrl, 'wav');
+  };
+
+  const handleDownloadMp3 = async () => {
+    setIsConvertingMp3(true);
+    try {
+      const wavBlob = currentAudio.audioBlob ?? await (await fetch(currentAudio.audioUrl)).blob();
+      const mp3Blob = await wavBlobToMp3Blob(wavBlob);
+      const mp3Url = URL.createObjectURL(mp3Blob);
+      triggerDownload(mp3Url, 'mp3');
+      window.setTimeout(() => URL.revokeObjectURL(mp3Url), 1_000);
+    } finally {
+      setIsConvertingMp3(false);
+    }
   };
 
   const handleShare = () => {
@@ -225,11 +244,19 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({ currentAudio }) => {
           </button>
 
           <button
-            onClick={handleDownload}
+            onClick={handleDownloadWav}
             className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition-all"
           >
             <Download className="w-4 h-4" />
-            <span>Descargar WAV</span>
+            <span>WAV</span>
+          </button>
+          <button
+            onClick={handleDownloadMp3}
+            disabled={isConvertingMp3}
+            className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold flex items-center space-x-1.5 shadow-sm transition-all disabled:opacity-60"
+          >
+            {isConvertingMp3 ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            <span>MP3</span>
           </button>
         </div>
       </div>
