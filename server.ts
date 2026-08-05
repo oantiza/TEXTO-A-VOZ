@@ -6,7 +6,35 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const MAX_TEXT_LENGTH = 24_000;
+const RATE_LIMIT_PER_MINUTE = Math.max(1, Number(process.env.TTS_RATE_LIMIT_PER_MINUTE) || 30);
+const ALLOWED_VOICES = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] as const;
+const ALLOWED_EMOTIONS = [
+  'natural',
+  'cheerful',
+  'calm',
+  'dramatic',
+  'news anchor',
+  'storyteller',
+  'whispering',
+  'fast',
+  'slow',
+] as const;
+const ALLOWED_ACCENTS = ['spain', 'latam', 'argentina', 'neutral'] as const;
+
+interface RateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+const ttsRateLimits = new Map<string, RateLimitEntry>();
+
+function extractAudioPart(response: any) {
+  return response?.candidates
+    ?.flatMap((candidate: any) => candidate?.content?.parts ?? [])
+    .find((part: any) => part?.inlineData?.data && String(part?.inlineData?.mimeType || '').startsWith('audio/'));
+}
 
 // Helper to construct prompt with tone, regional accent & target duration instructions
 function buildPromptText(text: string, emotion?: string, accent?: string, targetDuration?: number | null): string {
@@ -31,9 +59,9 @@ function buildPromptText(text: string, emotion?: string, accent?: string, target
   }
 
   if (instructions.length > 0) {
-    return `${instructions.join(', ')}:\n${text}`;
+    return `Synthesize speech using these director notes: ${instructions.join(', ')}.\n\nTRANSCRIPT (speak only this text):\n${text}`;
   }
-  return text;
+  return `Synthesize the following transcript as speech.\n\nTRANSCRIPT (speak only this text):\n${text}`;
 }
 
 // Helper for calling Gemini with exponential backoff retries for 503 / high demand / 429 rate limit errors
@@ -41,7 +69,13 @@ async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRe
   let lastError: any = null;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await aiClient.models.generateContent(genConfig);
+      const response = await aiClient.models.generateContent(genConfig);
+      if (!extractAudioPart(response)) {
+        const missingAudioError: any = new Error('El modelo no devolvió audio en este intento.');
+        missingAudioError.isMissingAudio = true;
+        throw missingAudioError;
+      }
+      return response;
     } catch (err: any) {
       lastError = err;
       const errStr = String(err?.message || err);
@@ -54,6 +88,7 @@ async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRe
 
       const isTransient =
         isQuota ||
+        err?.isMissingAudio === true ||
         err?.status === 503 ||
         err?.code === 503 ||
         errStr.includes("503") ||
@@ -71,7 +106,8 @@ async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRe
             delayMs = attempt * 8000;
           }
         }
-        console.warn(`[Gemini TTS Retry] Intento ${attempt}/${maxRetries} (${isQuota ? 'Cuota 429' : '503 Servidor'}). Esperando ${delayMs / 1000}s...`);
+        const reason = isQuota ? 'Cuota 429' : err?.isMissingAudio ? 'Respuesta sin audio' : '503 Servidor';
+        console.warn(`[Gemini TTS Retry] Intento ${attempt}/${maxRetries} (${reason}). Esperando ${delayMs / 1000}s...`);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       } else {
         throw err;
@@ -84,7 +120,8 @@ async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRe
 async function startServer() {
   const app = express();
 
-  app.use(express.json({ limit: "10mb" }));
+  if (process.env.TRUST_PROXY === 'true') app.set('trust proxy', 1);
+  app.use(express.json({ limit: '256kb' }));
 
   // Initialize Gemini AI SDK
   const ai = new GoogleGenAI({
@@ -101,11 +138,34 @@ async function startServer() {
     res.json({ status: "ok", model: "gemini-3.1-flash-tts-preview" });
   });
 
+  // Basic zero-cost protection for local/private deployments.
+  app.use('/api/tts', (req, res, next) => {
+    const now = Date.now();
+    const clientId = req.ip || req.socket.remoteAddress || 'unknown';
+    const current = ttsRateLimits.get(clientId);
+    const entry = !current || current.resetAt <= now ? { count: 0, resetAt: now + 60_000 } : current;
+    entry.count += 1;
+    ttsRateLimits.set(clientId, entry);
+
+    res.setHeader('X-RateLimit-Limit', RATE_LIMIT_PER_MINUTE);
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, RATE_LIMIT_PER_MINUTE - entry.count));
+    if (entry.count > RATE_LIMIT_PER_MINUTE) {
+      const retryAfterSec = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.setHeader('Retry-After', retryAfterSec);
+      return res.status(429).json({
+        error: `Límite temporal alcanzado. Reintenta en ${retryAfterSec} segundos.`,
+        isQuotaExhausted: true,
+        retryAfterSec,
+      });
+    }
+    next();
+  });
+
   // TTS Generation Endpoint
   app.post("/api/tts", async (req, res) => {
     try {
       const {
-        text,
+        text: rawText,
         voice = "Kore",
         emotion = "natural",
         accent = "neutral",
@@ -114,8 +174,50 @@ async function startServer() {
         speakers = [],
       } = req.body;
 
-      if (!text || typeof text !== "string" || text.trim() === "") {
+      const text = typeof rawText === 'string' ? rawText.trim() : '';
+
+      if (!text) {
         return res.status(400).json({ error: "El texto es requerido para la conversión." });
+      }
+      if (text.length > MAX_TEXT_LENGTH) {
+        return res.status(413).json({
+          error: `El texto supera el máximo de ${MAX_TEXT_LENGTH.toLocaleString('es-ES')} caracteres. Divídelo en fragmentos.`,
+        });
+      }
+      if (!ALLOWED_VOICES.includes(voice)) {
+        return res.status(400).json({ error: 'La voz seleccionada no es válida.' });
+      }
+      if (!ALLOWED_EMOTIONS.includes(emotion)) {
+        return res.status(400).json({ error: 'El estilo de voz seleccionado no es válido.' });
+      }
+      if (!ALLOWED_ACCENTS.includes(accent)) {
+        return res.status(400).json({ error: 'El acento seleccionado no es válido.' });
+      }
+      if (
+        targetDuration !== null &&
+        targetDuration !== undefined &&
+        (!Number.isFinite(Number(targetDuration)) || Number(targetDuration) < 0.5 || Number(targetDuration) > 300)
+      ) {
+        return res.status(400).json({ error: 'La duración objetivo debe estar entre 0,5 y 300 segundos.' });
+      }
+
+      let validatedSpeakers: Array<{ name: string; voiceName: (typeof ALLOWED_VOICES)[number] }> = [];
+      if (isMultiSpeaker) {
+        if (!Array.isArray(speakers) || speakers.length !== 2) {
+          return res.status(400).json({ error: 'El modo diálogo requiere exactamente dos hablantes.' });
+        }
+        validatedSpeakers = speakers.map((speaker: any) => ({
+          name: typeof speaker?.name === 'string' ? speaker.name.trim().slice(0, 40) : '',
+          voiceName: speaker?.voiceName,
+        }));
+        if (
+          validatedSpeakers.some(
+            (speaker) => !speaker.name || !ALLOWED_VOICES.includes(speaker.voiceName)
+          ) ||
+          validatedSpeakers[0].name.toLocaleLowerCase() === validatedSpeakers[1].name.toLocaleLowerCase()
+        ) {
+          return res.status(400).json({ error: 'Cada hablante necesita un nombre distinto y una voz válida.' });
+        }
       }
 
       if (!process.env.GEMINI_API_KEY) {
@@ -126,12 +228,12 @@ async function startServer() {
 
       let response;
 
-      if (isMultiSpeaker && Array.isArray(speakers) && speakers.length >= 2) {
+      if (isMultiSpeaker) {
         // Multi-speaker TTS
-        const speakerVoiceConfigs = speakers.slice(0, 2).map((sp) => ({
-          speaker: sp.name || "Hablante",
+        const speakerVoiceConfigs = validatedSpeakers.map((sp) => ({
+          speaker: sp.name,
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: sp.voiceName || "Kore" },
+            prebuiltVoiceConfig: { voiceName: sp.voiceName },
           },
         }));
 
@@ -144,9 +246,9 @@ async function startServer() {
             ? "in Argentine Rioplatense Spanish accent"
             : "in Spanish";
 
-        const promptText = `TTS the following dialogue ${accentInstruction} between ${
-          speakers[0].name || "Hablante 1"
-        } and ${speakers[1].name || "Hablante 2"}:\n${text}`;
+        const promptText = `Synthesize the following dialogue ${accentInstruction} between ${
+          validatedSpeakers[0].name
+        } and ${validatedSpeakers[1].name}. Speak only the transcript.\n\nTRANSCRIPT:\n${text}`;
 
         response = await generateTTSWithRetry(ai, {
           model: "gemini-3.1-flash-tts-preview",
@@ -178,7 +280,7 @@ async function startServer() {
         });
       }
 
-      const candidatePart = response.candidates?.[0]?.content?.parts?.[0];
+      const candidatePart = extractAudioPart(response);
       const audioData = candidatePart?.inlineData?.data;
       const mimeType = candidatePart?.inlineData?.mimeType || "audio/pcm;rate=24000";
 
@@ -237,7 +339,7 @@ async function startServer() {
       }
 
       res.status(500).json({
-        error: err.message || "Ocurrió un error al procesar el texto a voz.",
+        error: "No se pudo generar el audio. Reintenta en unos segundos.",
       });
     }
   });

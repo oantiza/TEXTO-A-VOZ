@@ -68,10 +68,17 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // File upload handler for text documents (.txt, .md, .srt, .vtt, etc.)
+  // File upload handler for the text and subtitle formats parsed by the app.
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    const extension = file.name.split('.').pop()?.toLowerCase();
+    if (!extension || !['txt', 'md', 'srt', 'vtt'].includes(extension)) {
+      setGlobalError('Formato no compatible. Utiliza TXT, Markdown, SRT o VTT.');
+      e.target.value = '';
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = (event) => {
@@ -133,6 +140,16 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   // Count lines
   const allLines = parsedScript.chapters.flatMap((c) => c.lines);
   const generatedLinesCount = allLines.filter((l) => l.audioUrl).length;
+
+  const updateLineState = (lineId: string, changes: Partial<ScriptLine>) => {
+    setParsedScript((prev) => ({
+      ...prev,
+      chapters: prev.chapters.map((chapter) => ({
+        ...chapter,
+        lines: chapter.lines.map((line) => (line.id === lineId ? { ...line, ...changes } : line)),
+      })),
+    }));
+  };
 
   // Generate entire script audio in 1 single API call (consumes only 1 request quota)
   const generateFullScriptSingleRequest = async () => {
@@ -324,7 +341,9 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     setProgressCount(0);
     setTotalLinesCount(allLines.length);
 
-    const linesToProcess = parsedScript.chapters.flatMap((c) => c.lines);
+    // Keep a local snapshot updated alongside React state so the final compilation
+    // never reads the stale state captured before the asynchronous generation loop.
+    const linesToProcess = parsedScript.chapters.flatMap((c) => c.lines).map((line) => ({ ...line }));
 
     for (let i = 0; i < linesToProcess.length; i++) {
       const line = linesToProcess[i];
@@ -333,17 +352,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       // Skip if already generated
       if (line.audioUrl) continue;
 
-      setParsedScript((prev) => {
-        const updated = { ...prev };
-        for (const chap of updated.chapters) {
-          const found = chap.lines.find((l) => l.id === line.id);
-          if (found) {
-            found.isGenerating = true;
-            found.error = undefined;
-          }
-        }
-        return updated;
-      });
+      updateLineState(line.id, { isGenerating: true, error: undefined });
 
       let success = false;
       let attempts = 0;
@@ -387,19 +396,19 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             line.targetDurationSec
           );
 
-          setParsedScript((prev) => {
-            const updated = { ...prev };
-            for (const chap of updated.chapters) {
-              const found = chap.lines.find((l) => l.id === line.id);
-              if (found) {
-                found.audioUrl = blobUrl;
-                found.actualDurationSec = duration;
-                found.speedFactor = speedFactor;
-                found.isGenerating = false;
-                found.error = undefined;
-              }
-            }
-            return updated;
+          Object.assign(line, {
+            audioUrl: blobUrl,
+            actualDurationSec: duration,
+            speedFactor,
+            isGenerating: false,
+            error: undefined,
+          });
+          updateLineState(line.id, {
+            audioUrl: blobUrl,
+            actualDurationSec: duration,
+            speedFactor,
+            isGenerating: false,
+            error: undefined,
           });
 
           setGlobalError(null);
@@ -411,17 +420,9 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           console.error(`Error en la frase [${line.startSec}s] intento ${attempts}:`, err);
 
           if (attempts >= 3) {
-            setParsedScript((prev) => {
-              const updated = { ...prev };
-              for (const chap of updated.chapters) {
-                const found = chap.lines.find((l) => l.id === line.id);
-                if (found) {
-                  found.isGenerating = false;
-                  found.error = err.message || 'Límite de API / error de conexión';
-                }
-              }
-              return updated;
-            });
+            const error = err.message || 'Límite de API / error de conexión';
+            Object.assign(line, { isGenerating: false, error });
+            updateLineState(line.id, { isGenerating: false, error });
           } else {
             // Wait 5s before retry
             await new Promise((res) => setTimeout(res, 5000));
@@ -433,12 +434,14 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     setIsGeneratingAll(false);
 
     // After generating all available lines, stitch continuous master audio track
-    await compileMasterAudioTrack();
+    await compileMasterAudioTrack(linesToProcess);
   };
 
   // Stitch master continuous WAV audio
-  const compileMasterAudioTrack = async () => {
-    const linesWithAudio = parsedScript.chapters.flatMap((c) => c.lines).filter((l) => l.audioUrl);
+  const compileMasterAudioTrack = async (sourceLines?: ScriptLine[]) => {
+    const linesWithAudio = (sourceLines ?? parsedScript.chapters.flatMap((c) => c.lines)).filter(
+      (line) => line.audioUrl
+    );
     if (linesWithAudio.length === 0) {
       setGlobalError('No hay frases generadas para unir en un audio final.');
       return;
@@ -513,10 +516,10 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             <div className="flex items-center space-x-2">
               <label className="cursor-pointer inline-flex items-center space-x-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-500 px-3.5 py-1.5 rounded-xl shadow-sm transition-all border border-indigo-400/30">
                 <Upload className="w-3.5 h-3.5" />
-                <span>Subir Nuevo Documento (.txt / .doc / .md)</span>
+                <span>Importar TXT / MD / SRT / VTT</span>
                 <input
                   type="file"
-                  accept=".txt,.md,.srt,.vtt,.doc,.docx"
+                  accept=".txt,.md,.srt,.vtt"
                   onChange={handleFileUpload}
                   className="hidden"
                 />
@@ -722,7 +725,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           {/* Compile Master Audio Track */}
           {generatedLinesCount > 0 && (
             <button
-              onClick={compileMasterAudioTrack}
+              onClick={() => compileMasterAudioTrack()}
               disabled={isGeneratingAll || isCompilingMaster}
               className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
             >

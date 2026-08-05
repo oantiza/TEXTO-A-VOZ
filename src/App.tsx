@@ -42,6 +42,14 @@ export default function App() {
 
   const [currentAudio, setCurrentAudio] = useState<GeneratedAudioItem | null>(null);
   const [history, setHistory] = useState<GeneratedAudioItem[]>([]);
+  const historyRef = React.useRef<GeneratedAudioItem[]>([]);
+  historyRef.current = history;
+
+  useEffect(() => {
+    return () => {
+      historyRef.current.forEach((item) => URL.revokeObjectURL(item.audioUrl));
+    };
+  }, []);
 
   // Check backend server health
   useEffect(() => {
@@ -161,6 +169,8 @@ export default function App() {
   };
 
   const handleDeleteAudio = (id: string) => {
+    const itemToDelete = history.find((item) => item.id === id);
+    if (itemToDelete) URL.revokeObjectURL(itemToDelete.audioUrl);
     setHistory((prev) => prev.filter((item) => item.id !== id));
     if (currentAudio?.id === id) {
       setCurrentAudio(null);
@@ -168,6 +178,7 @@ export default function App() {
   };
 
   const handleClearHistory = () => {
+    history.forEach((item) => URL.revokeObjectURL(item.audioUrl));
     setHistory([]);
     setCurrentAudio(null);
   };
@@ -327,7 +338,7 @@ export default function App() {
                 </p>
                 <div className="pt-1 flex items-center space-x-2 text-[11px] text-indigo-300">
                   <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Procesado 100% en servidor seguro</span>
+                  <span>Clave de Gemini protegida en el servidor</span>
                 </div>
               </div>
             </div>

@@ -23,7 +23,7 @@ export const Header: React.FC<HeaderProps> = ({ serverStatus }) => {
               </span>
             </div>
             <p className="text-xs text-slate-500 hidden sm:block">
-              Generación de locución ultranatural multi-voz y síntesis en tiempo real
+              Generación de locuciones naturales con una o dos voces
             </p>
           </div>
         </div>

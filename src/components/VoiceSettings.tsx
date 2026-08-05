@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { VOICE_OPTIONS, TONE_EMOTIONS, ACCENT_OPTIONS } from '../data';
 import { VoiceName, ToneEmotion, AccentOption, SpeakerConfig, VoiceOption } from '../types';
 import { base64ToWavBlob } from '../utils/audio';
@@ -58,6 +58,15 @@ export const VoiceSettings: React.FC<VoiceSettingsProps> = ({
   const [playingSampleVoice, setPlayingSampleVoice] = useState<string | null>(null);
   const [activeAudioObj, setActiveAudioObj] = useState<HTMLAudioElement | null>(null);
   const [sampleNotice, setSampleNotice] = useState<string | null>(null);
+  const sampleUrlsRef = useRef<Set<string>>(new Set());
+  const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      activeAudioRef.current?.pause();
+      sampleUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
 
   const updateSpeaker = (index: number, key: 'name' | 'voiceName', value: string) => {
     setSpeakers((prev) => {
@@ -85,6 +94,7 @@ export const VoiceSettings: React.FC<VoiceSettingsProps> = ({
 
     if (sampleCache[voice.id]) {
       const audio = new Audio(sampleCache[voice.id]);
+      activeAudioRef.current = audio;
       setActiveAudioObj(audio);
       setPlayingSampleVoice(voice.id);
       audio.play();
@@ -120,8 +130,10 @@ export const VoiceSettings: React.FC<VoiceSettingsProps> = ({
         data.mimeType || 'audio/pcm;rate=24000'
       );
 
+      sampleUrlsRef.current.add(blobUrl);
       setSampleCache((prev) => ({ ...prev, [voice.id]: blobUrl }));
       const audio = new Audio(blobUrl);
+      activeAudioRef.current = audio;
       setActiveAudioObj(audio);
       setPlayingSampleVoice(voice.id);
       audio.play();
@@ -176,14 +188,14 @@ export const VoiceSettings: React.FC<VoiceSettingsProps> = ({
           <div>
             <div className="flex items-center space-x-2">
               <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
-                Acento Exclusivo: Castellano (España)
+                Acento preferente: Castellano (España)
               </h3>
               <span className="bg-emerald-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
                 Activo
               </span>
             </div>
             <p className="text-xs text-slate-600 mt-0.5">
-              Garantizado el 100% de pronunciación en castellano de España para todas las frases y guiones.
+              La locución recibe instrucciones específicas de pronunciación en castellano de España.
             </p>
           </div>
         </div>
