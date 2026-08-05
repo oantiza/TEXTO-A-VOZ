@@ -1,5 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { VoiceName, ToneEmotion, AccentOption, ScriptChapter, ScriptLine, ParsedScript } from '../types';
+import {
+  VoiceName,
+  ToneEmotion,
+  AccentOption,
+  SpeakerConfig,
+  ScriptChapter,
+  ScriptLine,
+  ParsedScript,
+} from '../types';
 import { parseVideoScript, DEFAULT_NUVIA_SCRIPT, combineScriptAudioSegments, secondsToTimeString } from '../utils/scriptParser';
 import { base64ToWavBlob } from '../utils/audio';
 import {
