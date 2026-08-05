@@ -77,6 +77,25 @@ TRUST_PROXY=true
 
 En producción se debe usar HTTPS. `ALLOW_INSECURE_HTTP=true` está reservado para pruebas controladas en una red local.
 
+## Despliegue web actual
+
+La aplicación está desplegada como servicio privado en Google Cloud Run:
+
+- URL: [https://texto-a-voz-2qdvewjg7a-ew.a.run.app](https://texto-a-voz-2qdvewjg7a-ew.a.run.app)
+- Región: `europe-west1`
+- Servicio: `texto-a-voz`
+- Escalado mínimo: cero instancias cuando no se utiliza.
+- Escalado máximo: una instancia para limitar el consumo.
+- Clave de Gemini y contraseña: almacenadas en Google Secret Manager.
+
+La contraseña de acceso generada se conserva también como variable de usuario de Windows. Para consultarla localmente:
+
+```powershell
+[Environment]::GetEnvironmentVariable('TEXTO_A_VOZ_ACCESS_PASSWORD', 'User')
+```
+
+Los proyectos permanecen en el navegador de cada dispositivo. Para trasladarlos entre navegadores se utiliza **Copia** e **Importar**.
+
 ## Controles de calidad
 
 ```powershell
