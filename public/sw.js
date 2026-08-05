@@ -1,4 +1,4 @@
-const CACHE_NAME = 'texto-a-voz-v1';
+const CACHE_NAME = 'texto-a-voz-v2';
 const APP_SHELL = ['/', '/manifest.webmanifest', '/icons/icon.svg'];
 
 self.addEventListener('install', (event) => {
