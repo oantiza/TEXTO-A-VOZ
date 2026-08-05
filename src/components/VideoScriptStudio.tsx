@@ -74,6 +74,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   // Audio Playback state
   const [masterAudioUrl, setMasterAudioUrl] = useState<string | null>(null);
   const [masterAudioBlob, setMasterAudioBlob] = useState<Blob | null>(null);
+  const [masterDurationSec, setMasterDurationSec] = useState<number | null>(null);
+  const [masterIsPreciselySynced, setMasterIsPreciselySynced] = useState<boolean>(false);
   const [isConvertingMasterMp3, setIsConvertingMasterMp3] = useState<boolean>(false);
   const [isPlayingMaster, setIsPlayingMaster] = useState<boolean>(false);
   const [currentTimeSec, setCurrentTimeSec] = useState<number>(0);
@@ -202,7 +204,9 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           voice: selectedVoice,
           emotion: selectedEmotion,
           accent: selectedAccent,
-          targetDuration: undefined,
+          // Let Gemini pace the whole narration naturally near the desired length.
+          // Long-form client-side stretching can accumulate artifacts at the tail.
+          targetDuration: parsedScript.totalDurationSec <= 300 ? parsedScript.totalDurationSec : undefined,
           isMultiSpeaker,
           speakers: isMultiSpeaker ? speakers : undefined,
         }),
@@ -211,14 +215,15 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'Error al generar locución completa');
 
-      const { blob, blobUrl } = base64ToWavBlob(
+      const { blob, blobUrl, duration } = base64ToWavBlob(
         data.audioBase64,
-        data.mimeType || 'audio/pcm;rate=24000',
-        parsedScript.totalDurationSec
+        data.mimeType || 'audio/pcm;rate=24000'
       );
 
       setMasterAudioUrl(blobUrl);
       setMasterAudioBlob(blob);
+      setMasterDurationSec(duration);
+      setMasterIsPreciselySynced(false);
 
       if (onAddToHistory) {
         onAddToHistory({
@@ -227,7 +232,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           voice: selectedVoice,
           emotion: selectedEmotion,
           accent: selectedAccent,
-          durationSeconds: parsedScript.totalDurationSec,
+          durationSeconds: duration,
           audioBlob: blob,
           audioUrl: blobUrl,
           createdAt: new Date().toISOString(),
@@ -266,7 +271,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           voice: selectedVoice,
           emotion: selectedEmotion,
           accent: selectedAccent,
-          targetDuration: undefined,
+          targetDuration: chapterDuration <= 300 ? chapterDuration : undefined,
           isMultiSpeaker,
           speakers: isMultiSpeaker ? speakers : undefined,
         }),
@@ -277,8 +282,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
       const { blobUrl } = base64ToWavBlob(
         data.audioBase64,
-        data.mimeType || 'audio/pcm;rate=24000',
-        chapterDuration
+        data.mimeType || 'audio/pcm;rate=24000'
       );
 
       setParsedScript((prev) => {
@@ -492,6 +496,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       );
       setMasterAudioUrl(masterBlobUrl);
       setMasterAudioBlob(masterBlob);
+      setMasterDurationSec(parsedScript.totalDurationSec);
+      setMasterIsPreciselySynced(true);
 
       if (onAddToHistory) {
         onAddToHistory({
@@ -702,7 +708,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
               <div>
                 <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-300 block">
-                  Pista máster sincronizada ({secondsToTimeString(parsedScript.totalDurationSec)})
+                  {masterIsPreciselySynced ? 'Pista máster sincronizada' : 'Pista completa con voz natural'} ({secondsToTimeString(masterDurationSec ?? parsedScript.totalDurationSec)})
                 </span>
                 <h4 className="text-base font-bold text-white">Audio Completo del Vídeo Integrado</h4>
               </div>
@@ -735,12 +741,12 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs font-mono text-indigo-300">
               <span>{secondsToTimeString(currentTimeSec)}</span>
-              <span>{secondsToTimeString(parsedScript.totalDurationSec)}</span>
+              <span>{secondsToTimeString(masterDurationSec ?? parsedScript.totalDurationSec)}</span>
             </div>
             <input
               type="range"
               min={0}
-              max={parsedScript.totalDurationSec}
+              max={masterDurationSec ?? parsedScript.totalDurationSec}
               step={0.1}
               value={currentTimeSec}
               onChange={handleSeekMaster}

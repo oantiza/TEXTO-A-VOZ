@@ -44,4 +44,16 @@ describe('timeStretchPcm16', () => {
     expect(mp3.type).toBe('audio/mpeg');
     expect(mp3.size).toBeGreaterThan(100);
   });
+
+  it('keeps natural long-form PCM untouched when no exact duration is forced', async () => {
+    const source = createSineWave(220, 1);
+    const base64 = Buffer.from(source).toString('base64');
+    const result = base64ToWavBlob(base64, 'audio/pcm;rate=24000');
+    const wav = new Uint8Array(await result.blob.arrayBuffer());
+
+    expect(result.duration).toBe(1);
+    expect(result.originalDuration).toBe(1);
+    expect(result.speedFactor).toBe(1);
+    expect(wav.slice(44)).toEqual(source);
+  });
 });
