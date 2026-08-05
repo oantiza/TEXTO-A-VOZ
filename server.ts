@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { splitTextForStableTts } from './src/utils/ttsChunking';
 
 dotenv.config();
 
@@ -72,9 +73,59 @@ function extractAudioPart(response: any) {
     .find((part: any) => part?.inlineData?.data && String(part?.inlineData?.mimeType || '').startsWith('audio/'));
 }
 
+function getPcmSampleRate(mimeType: string): number {
+  const match = mimeType.match(/rate=(\d+)/i);
+  return match ? Number(match[1]) : 24_000;
+}
+
+function isRawPcmMimeType(mimeType: string): boolean {
+  return /audio\/(?:pcm|l16)/i.test(mimeType) || /codec=pcm/i.test(mimeType);
+}
+
+function fadePcm16Edges(source: Buffer, sampleRate: number, fadeMilliseconds = 8): Buffer {
+  const output = Buffer.from(source);
+  const sampleCount = Math.floor(output.length / 2);
+  const fadeSamples = Math.min(sampleCount, Math.max(1, Math.round((sampleRate * fadeMilliseconds) / 1000)));
+
+  for (let index = 0; index < fadeSamples; index++) {
+    const gainIn = index / fadeSamples;
+    const gainOut = (fadeSamples - index - 1) / fadeSamples;
+    const endIndex = sampleCount - fadeSamples + index;
+    output.writeInt16LE(Math.round(output.readInt16LE(index * 2) * gainIn), index * 2);
+    output.writeInt16LE(Math.round(output.readInt16LE(endIndex * 2) * gainOut), endIndex * 2);
+  }
+  return output;
+}
+
+function combinePcmNarration(parts: Buffer[], mimeType: string): Buffer {
+  if (parts.length === 1) return parts[0];
+  if (!isRawPcmMimeType(mimeType)) {
+    throw new Error(`No se pueden unir fragmentos con el formato ${mimeType}.`);
+  }
+
+  const sampleRate = getPcmSampleRate(mimeType);
+  const silence = Buffer.alloc(Math.round(sampleRate * 0.08) * 2);
+  const output: Buffer[] = [];
+  parts.forEach((part, index) => {
+    if (index > 0) output.push(silence);
+    output.push(fadePcm16Edges(part, sampleRate));
+  });
+  return Buffer.concat(output);
+}
+
 // Helper to construct prompt with tone, regional accent & target duration instructions
-function buildPromptText(text: string, emotion?: string, accent?: string, targetDuration?: number | null): string {
+function buildPromptText(
+  text: string,
+  emotion?: string,
+  accent?: string,
+  targetDuration?: number | null,
+  continuingNarration = false
+): string {
   const instructions: string[] = [];
+
+  if (continuingNarration) {
+    instructions.push('Keep exactly the same configured voice identity, pitch range, accent, and delivery as every other segment of this continuous narration');
+  }
 
   if (accent === 'spain') {
     instructions.push('Say in a standard Peninsular Spanish accent from Spain (Castellano de España with clear distinción between z/c and s)');
@@ -310,73 +361,99 @@ async function startServer() {
         });
       }
 
-      let response;
+      const textChunks = splitTextForStableTts(text);
+      const audioParts: Buffer[] = [];
+      let outputMimeType = '';
+      const numericTargetDuration = targetDuration === null || targetDuration === undefined
+        ? null
+        : Number(targetDuration);
 
-      if (isMultiSpeaker) {
-        // Multi-speaker TTS
-        const speakerVoiceConfigs = validatedSpeakers.map((sp) => ({
-          speaker: sp.name,
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: sp.voiceName },
-          },
-        }));
+      console.log(`[Gemini TTS] ${text.length} caracteres en ${textChunks.length} fragmento(s) estable(s).`);
 
-        const accentInstruction =
-          accent === "spain"
-            ? "in standard Peninsular Spanish accent from Spain (Castellano de España)"
-            : accent === "latam"
-            ? "in Latin American Spanish accent"
-            : accent === "argentina"
-            ? "in Argentine Rioplatense Spanish accent"
-            : "in Spanish";
+      for (const [chunkIndex, textChunk] of textChunks.entries()) {
+        const chunkTargetDuration = numericTargetDuration
+          ? Math.max(0.5, numericTargetDuration * (textChunk.length / text.length))
+          : null;
+        let response;
 
-        const promptText = `Synthesize the following dialogue ${accentInstruction} between ${
-          validatedSpeakers[0].name
-        } and ${validatedSpeakers[1].name}. Speak only the transcript.\n\nTRANSCRIPT:\n${text}`;
+        if (isMultiSpeaker) {
+          const speakerVoiceConfigs = validatedSpeakers.map((sp) => ({
+            speaker: sp.name,
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: sp.voiceName },
+            },
+          }));
 
-        response = await generateTTSWithRetry(ai, {
-          model: "gemini-3.1-flash-tts-preview",
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              multiSpeakerVoiceConfig: {
-                speakerVoiceConfigs,
+          const accentInstruction =
+            accent === "spain"
+              ? "in standard Peninsular Spanish accent from Spain (Castellano de España)"
+              : accent === "latam"
+              ? "in Latin American Spanish accent"
+              : accent === "argentina"
+              ? "in Argentine Rioplatense Spanish accent"
+              : "in Spanish";
+
+          const durationInstruction = chunkTargetDuration
+            ? ` Pace this part to approximately ${chunkTargetDuration.toFixed(1)} seconds.`
+            : '';
+          const promptText = `Synthesize this continuing dialogue segment ${accentInstruction} between ${
+            validatedSpeakers[0].name
+          } and ${validatedSpeakers[1].name}. Keep exactly the configured voices and delivery.${durationInstruction} Speak only the transcript.\n\nTRANSCRIPT:\n${textChunk}`;
+
+          response = await generateTTSWithRetry(ai, {
+            model: "gemini-3.1-flash-tts-preview",
+            contents: [{ parts: [{ text: promptText }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                multiSpeakerVoiceConfig: {
+                  speakerVoiceConfigs,
+                },
               },
             },
-          },
-        });
-      } else {
-        // Single-speaker TTS with accent, emotion & target duration enhancement
-        const promptText = buildPromptText(text, emotion, accent, targetDuration);
+          });
+        } else {
+          const promptText = buildPromptText(
+            textChunk,
+            emotion,
+            accent,
+            chunkTargetDuration,
+            textChunks.length > 1
+          );
 
-        response = await generateTTSWithRetry(ai, {
-          model: "gemini-3.1-flash-tts-preview",
-          contents: [{ parts: [{ text: promptText }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: voice },
+          response = await generateTTSWithRetry(ai, {
+            model: "gemini-3.1-flash-tts-preview",
+            contents: [{ parts: [{ text: promptText }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: voice },
+                },
               },
             },
-          },
-        });
+          });
+        }
+
+        const candidatePart = extractAudioPart(response);
+        const audioData = candidatePart?.inlineData?.data;
+        const mimeType = candidatePart?.inlineData?.mimeType || "audio/pcm;rate=24000";
+        if (!audioData) {
+          throw new Error(`Gemini no devolvió audio para el fragmento ${chunkIndex + 1}.`);
+        }
+        if (outputMimeType && mimeType !== outputMimeType) {
+          throw new Error('Gemini devolvió formatos de audio incompatibles entre fragmentos.');
+        }
+        outputMimeType = mimeType;
+        audioParts.push(Buffer.from(audioData, 'base64'));
       }
 
-      const candidatePart = extractAudioPart(response);
-      const audioData = candidatePart?.inlineData?.data;
-      const mimeType = candidatePart?.inlineData?.mimeType || "audio/pcm;rate=24000";
-
-      if (!audioData) {
-        return res.status(500).json({
-          error: "No se pudo generar el audio de respuesta desde el modelo Gemini.",
-        });
-      }
-
+      const combinedAudio = combinePcmNarration(audioParts, outputMimeType || "audio/pcm;rate=24000");
       res.json({
-        audioBase64: audioData,
-        mimeType: mimeType,
+        audioBase64: combinedAudio.toString('base64'),
+        mimeType: outputMimeType || "audio/pcm;rate=24000",
+        segmentCount: textChunks.length,
+        stabilizedLongForm: textChunks.length > 1,
       });
     } catch (err: any) {
       const errStr = String(err?.message || err);
