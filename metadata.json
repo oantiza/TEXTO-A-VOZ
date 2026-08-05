@@ -1,0 +1,6 @@
+{
+  "name": "Texto a Voz AI",
+  "description": "Convierte cualquier texto en voz natural con IA utilizando Gemini 3.1 Flash TTS",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
