@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_NUVIA_SCRIPT, parseVideoScript } from './scriptParser';
+import { DEFAULT_NUVIA_SCRIPT, parseVideoScript, scriptToSrt, scriptToVtt } from './scriptParser';
 
 describe('parseVideoScript', () => {
   it('parses SRT cues with exact timing', () => {
@@ -43,5 +43,13 @@ Segunda línea.`);
 
     expect(parsed.totalDurationSec).toBe(180);
     expect(parsed.chapters.flatMap((chapter) => chapter.lines)).toHaveLength(59);
+  });
+
+  it('exports parsed timing as SRT and WebVTT', () => {
+    const parsed = parseVideoScript(`[00:00] Primera frase.\n[00:03] Segunda frase.`);
+
+    expect(scriptToSrt(parsed)).toContain('00:00:00,000 --> 00:00:03,000');
+    expect(scriptToVtt(parsed)).toMatch(/^WEBVTT/);
+    expect(scriptToVtt(parsed)).toContain('00:00:03.000 --> 00:00:07.000');
   });
 });

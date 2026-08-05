@@ -7,9 +7,17 @@ import {
   ScriptChapter,
   ScriptLine,
   ParsedScript,
+  GeneratedAudioItem,
 } from '../types';
-import { parseVideoScript, DEFAULT_NUVIA_SCRIPT, combineScriptAudioSegments, secondsToTimeString } from '../utils/scriptParser';
-import { base64ToWavBlob } from '../utils/audio';
+import {
+  combineScriptAudioSegments,
+  DEFAULT_NUVIA_SCRIPT,
+  parseVideoScript,
+  scriptToSrt,
+  scriptToVtt,
+  secondsToTimeString,
+} from '../utils/scriptParser';
+import { base64ToWavBlob, wavBlobToMp3Blob } from '../utils/audio';
 import {
   Video,
   Play,
@@ -33,15 +41,19 @@ import {
 } from 'lucide-react';
 
 interface VideoScriptStudioProps {
+  scriptText: string;
+  onScriptTextChange: (text: string) => void;
   selectedVoice: VoiceName;
   selectedEmotion: ToneEmotion;
   selectedAccent: AccentOption;
   isMultiSpeaker: boolean;
   speakers: SpeakerConfig[];
-  onAddToHistory?: (item: any) => void;
+  onAddToHistory?: (item: GeneratedAudioItem) => void;
 }
 
 export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
+  scriptText,
+  onScriptTextChange,
   selectedVoice,
   selectedEmotion,
   selectedAccent,
@@ -49,8 +61,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   speakers,
   onAddToHistory,
 }) => {
-  const [rawScriptText, setRawScriptText] = useState<string>(DEFAULT_NUVIA_SCRIPT);
-  const [parsedScript, setParsedScript] = useState<ParsedScript>(() => parseVideoScript(DEFAULT_NUVIA_SCRIPT));
+  const [parsedScript, setParsedScript] = useState<ParsedScript>(() => parseVideoScript(scriptText));
   const [showScriptEditor, setShowScriptEditor] = useState<boolean>(false);
 
   // Generation state
@@ -62,6 +73,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
   // Audio Playback state
   const [masterAudioUrl, setMasterAudioUrl] = useState<string | null>(null);
+  const [masterAudioBlob, setMasterAudioBlob] = useState<Blob | null>(null);
+  const [isConvertingMasterMp3, setIsConvertingMasterMp3] = useState<boolean>(false);
   const [isPlayingMaster, setIsPlayingMaster] = useState<boolean>(false);
   const [currentTimeSec, setCurrentTimeSec] = useState<number>(0);
   const [activeLineId, setActiveLineId] = useState<string | null>(null);
@@ -69,35 +82,44 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // File upload handler for the text and subtitle formats parsed by the app.
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.currentTarget;
     const file = e.target.files?.[0];
     if (!file) return;
 
     const extension = file.name.split('.').pop()?.toLowerCase();
-    if (!extension || !['txt', 'md', 'srt', 'vtt'].includes(extension)) {
-      setGlobalError('Formato no compatible. Utiliza TXT, Markdown, SRT o VTT.');
-      e.target.value = '';
+    if (!extension || !['txt', 'md', 'srt', 'vtt', 'docx'].includes(extension)) {
+      setGlobalError('Formato no compatible. Utiliza TXT, Markdown, SRT, VTT o DOCX.');
+      input.value = '';
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const content = event.target?.result as string;
+    try {
+      const content = extension === 'docx'
+        ? (await (await import('mammoth')).extractRawText({ arrayBuffer: await file.arrayBuffer() })).value
+        : await file.text();
+
       if (content) {
-        setRawScriptText(content);
+        onScriptTextChange(content);
         setShowScriptEditor(true);
+        setGlobalError(null);
+      } else {
+        setGlobalError('El archivo no contiene texto que se pueda importar.');
       }
-    };
-    reader.readAsText(file);
+    } catch {
+      setGlobalError('No se ha podido leer el archivo. Comprueba que no esté dañado.');
+    } finally {
+      input.value = '';
+    }
   };
 
   // Parse raw script text when it changes
   useEffect(() => {
     const timer = setTimeout(() => {
-      setParsedScript(parseVideoScript(rawScriptText));
+      setParsedScript(parseVideoScript(scriptText));
     }, 500);
     return () => clearTimeout(timer);
-  }, [rawScriptText]);
+  }, [scriptText]);
 
   // Audio timeupdate listener
   useEffect(() => {
@@ -151,6 +173,17 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     }));
   };
 
+  const downloadSubtitles = (format: 'srt' | 'vtt') => {
+    const content = format === 'srt' ? scriptToSrt(parsedScript) : scriptToVtt(parsedScript);
+    const blob = new Blob([content], { type: format === 'srt' ? 'application/x-subrip' : 'text/vtt' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${parsedScript.title.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'subtitulos'}.${format}`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Generate entire script audio in 1 single API call (consumes only 1 request quota)
   const generateFullScriptSingleRequest = async () => {
     setIsGeneratingAll(true);
@@ -178,13 +211,14 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'Error al generar locución completa');
 
-      const { blobUrl } = base64ToWavBlob(
+      const { blob, blobUrl } = base64ToWavBlob(
         data.audioBase64,
         data.mimeType || 'audio/pcm;rate=24000',
         parsedScript.totalDurationSec
       );
 
       setMasterAudioUrl(blobUrl);
+      setMasterAudioBlob(blob);
 
       if (onAddToHistory) {
         onAddToHistory({
@@ -194,6 +228,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           emotion: selectedEmotion,
           accent: selectedAccent,
           durationSeconds: parsedScript.totalDurationSec,
+          audioBlob: blob,
           audioUrl: blobUrl,
           createdAt: new Date().toISOString(),
           isMultiSpeaker,
@@ -451,8 +486,12 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     setGlobalError(null);
 
     try {
-      const { masterBlobUrl } = await combineScriptAudioSegments(linesWithAudio, parsedScript.totalDurationSec);
+      const { masterBlob, masterBlobUrl } = await combineScriptAudioSegments(
+        linesWithAudio,
+        parsedScript.totalDurationSec
+      );
       setMasterAudioUrl(masterBlobUrl);
+      setMasterAudioBlob(masterBlob);
 
       if (onAddToHistory) {
         onAddToHistory({
@@ -462,6 +501,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           emotion: selectedEmotion,
           accent: selectedAccent,
           durationSeconds: parsedScript.totalDurationSec,
+          audioBlob: masterBlob,
           audioUrl: masterBlobUrl,
           createdAt: new Date().toISOString(),
           isMultiSpeaker,
@@ -497,6 +537,24 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     }
   };
 
+  const downloadMasterMp3 = async () => {
+    if (!masterAudioBlob) return;
+    setIsConvertingMasterMp3(true);
+    try {
+      const mp3Blob = await wavBlobToMp3Blob(masterAudioBlob);
+      const url = URL.createObjectURL(mp3Blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${parsedScript.title.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'locucion-master'}.mp3`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    } catch {
+      setGlobalError('No se ha podido convertir la pista máster a MP3.');
+    } finally {
+      setIsConvertingMasterMp3(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Hidden Master Audio Element */}
@@ -513,17 +571,36 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
               <span>Estudio de Locución e Interpretación de Documentos</span>
             </div>
 
-            <div className="flex items-center space-x-2">
+            <div className="flex flex-wrap items-center gap-2">
               <label className="cursor-pointer inline-flex items-center space-x-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-500 px-3.5 py-1.5 rounded-xl shadow-sm transition-all border border-indigo-400/30">
                 <Upload className="w-3.5 h-3.5" />
-                <span>Importar TXT / MD / SRT / VTT</span>
+                <span>Importar TXT / MD / SRT / VTT / DOCX</span>
                 <input
                   type="file"
-                  accept=".txt,.md,.srt,.vtt"
+                  accept=".txt,.md,.srt,.vtt,.docx"
                   onChange={handleFileUpload}
                   className="hidden"
                 />
               </label>
+
+              {allLines.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => downloadSubtitles('srt')}
+                    className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-100 hover:text-white bg-white/10 px-3 py-1.5 rounded-xl border border-white/15 hover:bg-white/20"
+                  >
+                    <Download className="w-3.5 h-3.5" /> SRT
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => downloadSubtitles('vtt')}
+                    className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-100 hover:text-white bg-white/10 px-3 py-1.5 rounded-xl border border-white/15 hover:bg-white/20"
+                  >
+                    <Download className="w-3.5 h-3.5" /> VTT
+                  </button>
+                </>
+              )}
 
               <button
                 onClick={() => setShowScriptEditor(!showScriptEditor)}
@@ -540,7 +617,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             <p className="text-xs sm:text-sm text-indigo-200 mt-1 max-w-2xl">
               Sincronización automatizada de voz con marcas de tiempo exactas para cada frase y capítulo. Duración total del vídeo: {' '}
               <span className="font-bold text-white underline decoration-indigo-400">
-                {secondsToTimeString(parsedScript.totalDurationSec)} (3 minutos)
+                {secondsToTimeString(parsedScript.totalDurationSec)}
               </span>.
             </p>
           </div>
@@ -581,15 +658,15 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
               <span>Editor de Texto del Guión (Con Marcas de Tiempo)</span>
             </h3>
             <button
-              onClick={() => setRawScriptText(DEFAULT_NUVIA_SCRIPT)}
+              onClick={() => onScriptTextChange(DEFAULT_NUVIA_SCRIPT)}
               className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 underline"
             >
               Restablecer Guión Original (Nuvia Academy)
             </button>
           </div>
           <textarea
-            value={rawScriptText}
-            onChange={(e) => setRawScriptText(e.target.value)}
+            value={scriptText}
+            onChange={(e) => onScriptTextChange(e.target.value)}
             rows={10}
             className="w-full font-mono text-xs p-3.5 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:outline-none leading-relaxed text-slate-800"
             placeholder="Pega aquí tu guión con marcas de tiempo como [00:00] o 00:00–00:14..."
@@ -625,21 +702,32 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
               <div>
                 <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-300 block">
-                  Pista Máster Sincronizada (3:00 min)
+                  Pista máster sincronizada ({secondsToTimeString(parsedScript.totalDurationSec)})
                 </span>
                 <h4 className="text-base font-bold text-white">Audio Completo del Vídeo Integrado</h4>
               </div>
             </div>
 
-            <div className="flex items-center space-x-2 self-end sm:self-auto">
+            <div className="flex flex-wrap items-center gap-2 self-end sm:self-auto">
               <a
                 href={masterAudioUrl}
-                download="Master_Locucion_Dinero_Con_Criterio_3min.wav"
+                download="locucion-master.wav"
                 className="inline-flex items-center space-x-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-sm transition-all"
               >
                 <Download className="w-4 h-4" />
-                <span>Descargar Audio Máster (WAV 3:00)</span>
+                <span>Descargar WAV</span>
               </a>
+              {masterAudioBlob && (
+                <button
+                  type="button"
+                  onClick={downloadMasterMp3}
+                  disabled={isConvertingMasterMp3}
+                  className="inline-flex items-center space-x-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 text-white font-bold text-xs rounded-xl shadow-sm transition-all"
+                >
+                  {isConvertingMasterMp3 ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                  <span>{isConvertingMasterMp3 ? 'Convirtiendo…' : 'Descargar MP3'}</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -690,7 +778,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           {/* Direct 1-Request Generation */}
           <button
             onClick={generateFullScriptSingleRequest}
-            disabled={isGeneratingAll}
+            disabled={isGeneratingAll || allLines.length === 0}
             className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
           >
             {isGeneratingAll ? (
@@ -704,7 +792,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           {/* Sentence by Sentence Batch */}
           <button
             onClick={handleGenerateAllScriptLines}
-            disabled={isGeneratingAll || isCompilingMaster}
+            disabled={isGeneratingAll || isCompilingMaster || allLines.length === 0}
             className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
           >
             {isGeneratingAll ? (
@@ -788,7 +876,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                 ) : (
                   <button
                     onClick={() => generateChapterAudio(chap)}
-                    disabled={chap.isGenerating || isGeneratingAll}
+                    disabled={chap.isGenerating || isGeneratingAll || chap.lines.length === 0}
                     className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs rounded-lg transition-colors border border-indigo-200 disabled:opacity-50"
                   >
                     {chap.isGenerating ? (

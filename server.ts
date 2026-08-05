@@ -3,6 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 dotenv.config();
 
@@ -22,6 +23,9 @@ const ALLOWED_EMOTIONS = [
   'slow',
 ] as const;
 const ALLOWED_ACCENTS = ['spain', 'latam', 'argentina', 'neutral'] as const;
+const ACCESS_PASSWORD = process.env.APP_ACCESS_PASSWORD?.trim() || '';
+const SESSION_COOKIE = 'texto_a_voz_session';
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface RateLimitEntry {
   count: number;
@@ -29,6 +33,38 @@ interface RateLimitEntry {
 }
 
 const ttsRateLimits = new Map<string, RateLimitEntry>();
+const loginRateLimits = new Map<string, RateLimitEntry>();
+const authenticatedSessions = new Map<string, number>();
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  if (!header) return {};
+  return Object.fromEntries(
+    header.split(';').map((cookie) => {
+      const separator = cookie.indexOf('=');
+      return separator < 0
+        ? [cookie.trim(), '']
+        : [cookie.slice(0, separator).trim(), decodeURIComponent(cookie.slice(separator + 1))];
+    })
+  );
+}
+
+function isAuthenticated(cookieHeader: string | undefined): boolean {
+  if (!ACCESS_PASSWORD) return true;
+  const token = parseCookies(cookieHeader)[SESSION_COOKIE];
+  if (!token) return false;
+  const expiresAt = authenticatedSessions.get(token);
+  if (!expiresAt || expiresAt <= Date.now()) {
+    authenticatedSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function passwordMatches(candidate: string): boolean {
+  const expected = Buffer.from(ACCESS_PASSWORD);
+  const received = Buffer.from(candidate);
+  return expected.length === received.length && timingSafeEqual(expected, received);
+}
 
 function extractAudioPart(response: any) {
   return response?.candidates
@@ -136,6 +172,54 @@ async function startServer() {
   // API Routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", model: "gemini-3.1-flash-tts-preview" });
+  });
+
+  app.get('/api/auth/status', (req, res) => {
+    res.json({ required: Boolean(ACCESS_PASSWORD), authenticated: isAuthenticated(req.headers.cookie) });
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    if (!ACCESS_PASSWORD) return res.json({ authenticated: true });
+    const now = Date.now();
+    const clientId = req.ip || req.socket.remoteAddress || 'unknown';
+    const current = loginRateLimits.get(clientId);
+    const entry = !current || current.resetAt <= now ? { count: 0, resetAt: now + 15 * 60_000 } : current;
+    if (entry.count >= 10) {
+      const retryAfterSec = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.setHeader('Retry-After', retryAfterSec);
+      return res.status(429).json({ error: `Demasiados intentos. Reintenta en ${retryAfterSec} segundos.` });
+    }
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!passwordMatches(password)) {
+      entry.count += 1;
+      loginRateLimits.set(clientId, entry);
+      return res.status(401).json({ error: 'Contraseña incorrecta.' });
+    }
+    loginRateLimits.delete(clientId);
+    const token = randomBytes(32).toString('base64url');
+    authenticatedSessions.set(token, Date.now() + SESSION_DURATION_MS);
+    const secure = process.env.NODE_ENV === 'production' && process.env.ALLOW_INSECURE_HTTP !== 'true' ? '; Secure' : '';
+    res.setHeader(
+      'Set-Cookie',
+      `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(
+        SESSION_DURATION_MS / 1000
+      )}${secure}`
+    );
+    res.json({ authenticated: true });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const token = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+    if (token) authenticatedSessions.delete(token);
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+    res.json({ authenticated: false });
+  });
+
+  app.use('/api/tts', (req, res, next) => {
+    if (!isAuthenticated(req.headers.cookie)) {
+      return res.status(401).json({ error: 'Inicia sesión para generar audio.' });
+    }
+    next();
   });
 
   // Basic zero-cost protection for local/private deployments.

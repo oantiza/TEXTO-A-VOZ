@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Texto a Voz">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f46e5"/>
+      <stop offset="0.55" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#9333ea"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#background)"/>
+  <path d="M126 222h62l84-70c14-12 36-2 36 17v174c0 19-22 29-36 17l-84-70h-62c-18 0-32-14-32-32v-4c0-18 14-32 32-32Z" fill="#fff"/>
+  <path d="M350 204c25 29 25 75 0 104M389 164c47 51 47 133 0 184" fill="none" stroke="#fff" stroke-width="24" stroke-linecap="round"/>
+</svg>

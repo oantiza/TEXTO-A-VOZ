@@ -37,6 +37,7 @@ export interface GeneratedAudioItem {
   speedFactor?: number;
   isMultiSpeaker: boolean;
   speakers?: SpeakerConfig[];
+  audioBlob?: Blob;
   audioUrl: string;
   durationSeconds: number;
   createdAt: string;
@@ -86,4 +87,32 @@ export interface SampleTemplate {
   speakers?: SpeakerConfig[];
   isScriptMode?: boolean;
   scriptContent?: string;
+}
+
+export type AppMode = 'standard' | 'script';
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  audioCount: number;
+}
+
+export interface ProjectSnapshot {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  appMode: AppMode;
+  text: string;
+  scriptText: string;
+  selectedVoice: VoiceName;
+  selectedEmotion: ToneEmotion;
+  selectedAccent: AccentOption;
+  useTargetDuration: boolean;
+  targetDurationSeconds: number;
+  isMultiSpeaker: boolean;
+  speakers: SpeakerConfig[];
+  history: GeneratedAudioItem[];
 }

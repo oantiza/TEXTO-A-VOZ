@@ -109,7 +109,7 @@ export function base64ToWavBlob(
   base64Audio: string,
   mimeType: string = 'audio/pcm;rate=24000',
   targetDurationSeconds?: number | null
-): { blobUrl: string; duration: number; originalDuration: number; speedFactor: number } {
+): { blob: Blob; blobUrl: string; duration: number; originalDuration: number; speedFactor: number } {
   const binaryString = atob(base64Audio);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
@@ -173,11 +173,63 @@ export function base64ToWavBlob(
   const blobUrl = URL.createObjectURL(blob);
 
   return {
+    blob,
     blobUrl,
     duration: Math.round(finalDurationSeconds * 10) / 10,
     originalDuration: Math.round(origDurationSeconds * 10) / 10,
     speedFactor: Math.round(speedFactor * 100) / 100,
   };
+}
+
+/** Convert the mono 16-bit WAV files produced by the app to MP3 in the browser. */
+export async function wavBlobToMp3Blob(wavBlob: Blob, kbps = 128): Promise<Blob> {
+  const buffer = await wavBlob.arrayBuffer();
+  const view = new DataView(buffer);
+  if (buffer.byteLength < 44 || view.getUint32(0, false) !== 0x52494646 || view.getUint32(8, false) !== 0x57415645) {
+    throw new Error('El archivo de audio no es un WAV válido.');
+  }
+
+  let channels = 1;
+  let sampleRate = 24_000;
+  let bitsPerSample = 16;
+  let dataOffset = -1;
+  let dataLength = 0;
+
+  for (let offset = 12; offset + 8 <= buffer.byteLength; ) {
+    const chunkId = view.getUint32(offset, false);
+    const chunkLength = view.getUint32(offset + 4, true);
+    if (chunkId === 0x666d7420 && chunkLength >= 16) {
+      channels = view.getUint16(offset + 10, true);
+      sampleRate = view.getUint32(offset + 12, true);
+      bitsPerSample = view.getUint16(offset + 22, true);
+    } else if (chunkId === 0x64617461) {
+      dataOffset = offset + 8;
+      dataLength = Math.min(chunkLength, buffer.byteLength - dataOffset);
+      break;
+    }
+    offset += 8 + chunkLength + (chunkLength % 2);
+  }
+
+  if (dataOffset < 0 || channels !== 1 || bitsPerSample !== 16) {
+    throw new Error('Solo se pueden convertir WAV mono de 16 bits.');
+  }
+
+  const sampleCount = Math.floor(dataLength / 2);
+  const samples = new Int16Array(sampleCount);
+  for (let index = 0; index < sampleCount; index++) {
+    samples[index] = view.getInt16(dataOffset + index * 2, true);
+  }
+
+  const encoder = new Mp3Encoder(1, sampleRate, kbps);
+  const chunks: Uint8Array[] = [];
+  const blockSize = 1152;
+  for (let index = 0; index < samples.length; index += blockSize) {
+    const encoded = encoder.encodeBuffer(samples.subarray(index, index + blockSize));
+    if (encoded.length > 0) chunks.push(new Uint8Array(encoded));
+  }
+  const finalChunk = encoder.flush();
+  if (finalChunk.length > 0) chunks.push(new Uint8Array(finalChunk));
+  return new Blob(chunks, { type: 'audio/mpeg' });
 }
 
 export function formatTime(seconds: number): string {
@@ -186,3 +238,4 @@ export function formatTime(seconds: number): string {
   const secs = Math.floor(seconds % 60);
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
+import { Mp3Encoder } from '@breezystack/lamejs';

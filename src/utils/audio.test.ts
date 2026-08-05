@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { timeStretchPcm16 } from './audio';
+import { base64ToWavBlob, timeStretchPcm16, wavBlobToMp3Blob } from './audio';
 
 const SAMPLE_RATE = 24_000;
 
@@ -33,5 +33,15 @@ describe('timeStretchPcm16', () => {
     expect(stretched.byteLength).toBe(Math.round(SAMPLE_RATE * targetSeconds) * 2);
     expect(estimateFrequency(stretched, targetSeconds)).toBeGreaterThan(430);
     expect(estimateFrequency(stretched, targetSeconds)).toBeLessThan(450);
+  });
+
+  it('encodes the generated WAV as a downloadable MP3', async () => {
+    const source = createSineWave(440, 0.25);
+    const base64 = Buffer.from(source).toString('base64');
+    const { blob } = base64ToWavBlob(base64, 'audio/pcm;rate=24000');
+    const mp3 = await wavBlobToMp3Blob(blob);
+
+    expect(mp3.type).toBe('audio/mpeg');
+    expect(mp3.size).toBeGreaterThan(100);
   });
 });

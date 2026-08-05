@@ -127,6 +127,41 @@ interface SubtitleCue {
   text: string;
 }
 
+function secondsToSubtitleTime(totalSeconds: number, decimalSeparator: ',' | '.'): string {
+  const totalMilliseconds = Math.round(Math.max(0, totalSeconds) * 1000);
+  const hours = Math.floor(totalMilliseconds / 3_600_000);
+  const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
+  const seconds = Math.floor((totalMilliseconds % 60_000) / 1000);
+  const milliseconds = totalMilliseconds % 1000;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds
+    .toString()
+    .padStart(2, '0')}${decimalSeparator}${milliseconds.toString().padStart(3, '0')}`;
+}
+
+export function scriptToSrt(script: ParsedScript): string {
+  return script.chapters
+    .flatMap((chapter) => chapter.lines)
+    .map(
+      (line, index) =>
+        `${index + 1}\n${secondsToSubtitleTime(line.startSec, ',')} --> ${secondsToSubtitleTime(
+          line.endSec,
+          ','
+        )}\n${line.text}`
+    )
+    .join('\n\n');
+}
+
+export function scriptToVtt(script: ParsedScript): string {
+  const cues = script.chapters
+    .flatMap((chapter) => chapter.lines)
+    .map(
+      (line) =>
+        `${secondsToSubtitleTime(line.startSec, '.')} --> ${secondsToSubtitleTime(line.endSec, '.')}\n${line.text}`
+    )
+    .join('\n\n');
+  return `WEBVTT\n\n${cues}`;
+}
+
 function subtitleTimeToSeconds(value: string): number {
   const parts = value.replace(',', '.').split(':').map(Number);
   if (parts.some((part) => !Number.isFinite(part))) return 0;
@@ -368,7 +403,7 @@ export function parseVideoScript(scriptText: string): ParsedScript {
 export async function combineScriptAudioSegments(
   lines: ScriptLine[],
   totalDurationSec: number
-): Promise<{ masterBlobUrl: string; totalBytes: number }> {
+): Promise<{ masterBlob: Blob; masterBlobUrl: string; totalBytes: number }> {
   const sampleRate = 24000;
   const numChannels = 1;
   const bitsPerSample = 16;
@@ -434,5 +469,5 @@ export async function combineScriptAudioSegments(
   const blob = new Blob([fullWavBytes], { type: 'audio/wav' });
   const masterBlobUrl = URL.createObjectURL(blob);
 
-  return { masterBlobUrl, totalBytes: fullWavBytes.length };
+  return { masterBlob: blob, masterBlobUrl, totalBytes: fullWavBytes.length };
 }

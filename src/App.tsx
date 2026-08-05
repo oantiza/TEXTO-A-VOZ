@@ -5,8 +5,29 @@ import { VoiceSettings } from './components/VoiceSettings';
 import { AudioPlayer } from './components/AudioPlayer';
 import { HistoryList } from './components/HistoryList';
 import { VideoScriptStudio } from './components/VideoScriptStudio';
-import { VoiceName, ToneEmotion, AccentOption, SpeakerConfig, GeneratedAudioItem, SampleTemplate } from './types';
+import { ProjectBar } from './components/ProjectBar';
+import { LoginScreen } from './components/LoginScreen';
+import {
+  AccentOption,
+  AppMode,
+  GeneratedAudioItem,
+  ProjectSnapshot,
+  ProjectSummary,
+  SampleTemplate,
+  SpeakerConfig,
+  ToneEmotion,
+  VoiceName,
+} from './types';
 import { base64ToWavBlob } from './utils/audio';
+import {
+  createBlankProject,
+  deleteProject,
+  exportProject,
+  importProject,
+  listProjects,
+  loadProject,
+  saveProject,
+} from './storage/projectStore';
 import {
   Volume2,
   Sparkles,
@@ -20,28 +41,37 @@ import {
 } from 'lucide-react';
 
 export default function App() {
-  const [appMode, setAppMode] = useState<'standard' | 'script'>('script'); // Default to script mode as requested
-  const [text, setText] = useState<string>(
-    '¡Hola! Bienvenido a la herramienta de transformación de texto a voz impulsada por inteligencia artificial. Elige la voz que prefieras en castellano (España) y presiona el botón para escuchar la locución.'
-  );
-  const [selectedVoice, setSelectedVoice] = useState<VoiceName>('Kore');
-  const [selectedEmotion, setSelectedEmotion] = useState<ToneEmotion>('natural');
-  const [selectedAccent, setSelectedAccent] = useState<AccentOption>('spain');
-  const [useTargetDuration, setUseTargetDuration] = useState<boolean>(false);
-  const [targetDurationSeconds, setTargetDurationSeconds] = useState<number>(12);
-  const [isMultiSpeaker, setIsMultiSpeaker] = useState<boolean>(false);
-  const [speakers, setSpeakers] = useState<SpeakerConfig[]>([
-    { name: 'Carlos', voiceName: 'Puck' },
-    { name: 'María', voiceName: 'Kore' },
-  ]);
+  const initialProjectRef = React.useRef<ProjectSnapshot | null>(null);
+  if (!initialProjectRef.current) initialProjectRef.current = createBlankProject('Mi primer proyecto');
+  const initialProject = initialProjectRef.current;
+
+  const [projectId, setProjectId] = useState(initialProject.id);
+  const [projectName, setProjectName] = useState(initialProject.name);
+  const [projectCreatedAt, setProjectCreatedAt] = useState(initialProject.createdAt);
+  const [projectUpdatedAt, setProjectUpdatedAt] = useState(initialProject.updatedAt);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saving');
+  const [isProjectReady, setIsProjectReady] = useState(false);
+
+  const [appMode, setAppMode] = useState<AppMode>(initialProject.appMode);
+  const [text, setText] = useState<string>(initialProject.text);
+  const [scriptText, setScriptText] = useState<string>(initialProject.scriptText);
+  const [selectedVoice, setSelectedVoice] = useState<VoiceName>(initialProject.selectedVoice);
+  const [selectedEmotion, setSelectedEmotion] = useState<ToneEmotion>(initialProject.selectedEmotion);
+  const [selectedAccent, setSelectedAccent] = useState<AccentOption>(initialProject.selectedAccent);
+  const [useTargetDuration, setUseTargetDuration] = useState<boolean>(initialProject.useTargetDuration);
+  const [targetDurationSeconds, setTargetDurationSeconds] = useState<number>(initialProject.targetDurationSeconds);
+  const [isMultiSpeaker, setIsMultiSpeaker] = useState<boolean>(initialProject.isMultiSpeaker);
+  const [speakers, setSpeakers] = useState<SpeakerConfig[]>(initialProject.speakers);
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isHighDemand, setIsHighDemand] = useState<boolean>(false);
   const [serverStatus, setServerStatus] = useState<'connected' | 'checking' | 'error'>('checking');
+  const [authStatus, setAuthStatus] = useState<'checking' | 'granted' | 'required'>('checking');
 
   const [currentAudio, setCurrentAudio] = useState<GeneratedAudioItem | null>(null);
-  const [history, setHistory] = useState<GeneratedAudioItem[]>([]);
+  const [history, setHistory] = useState<GeneratedAudioItem[]>(initialProject.history);
   const historyRef = React.useRef<GeneratedAudioItem[]>([]);
   historyRef.current = history;
 
@@ -50,6 +80,184 @@ export default function App() {
       historyRef.current.forEach((item) => URL.revokeObjectURL(item.audioUrl));
     };
   }, []);
+
+  const makeProjectSnapshot = (): ProjectSnapshot => ({
+    id: projectId,
+    name: projectName.trim() || 'Proyecto sin título',
+    createdAt: projectCreatedAt,
+    updatedAt: projectUpdatedAt,
+    appMode,
+    text,
+    scriptText,
+    selectedVoice,
+    selectedEmotion,
+    selectedAccent,
+    useTargetDuration,
+    targetDurationSeconds,
+    isMultiSpeaker,
+    speakers,
+    history,
+  });
+
+  const applyProjectSnapshot = (project: ProjectSnapshot) => {
+    historyRef.current.forEach((item) => URL.revokeObjectURL(item.audioUrl));
+    setProjectId(project.id);
+    setProjectName(project.name);
+    setProjectCreatedAt(project.createdAt);
+    setProjectUpdatedAt(project.updatedAt);
+    setAppMode(project.appMode);
+    setText(project.text);
+    setScriptText(project.scriptText);
+    setSelectedVoice(project.selectedVoice);
+    setSelectedEmotion(project.selectedEmotion);
+    setSelectedAccent(project.selectedAccent);
+    setUseTargetDuration(project.useTargetDuration);
+    setTargetDurationSeconds(project.targetDurationSeconds);
+    setIsMultiSpeaker(project.isMultiSpeaker);
+    setSpeakers(project.speakers);
+    setHistory(project.history);
+    setCurrentAudio(project.history[0] ?? null);
+  };
+
+  const refreshProjects = async () => setProjects(await listProjects());
+
+  useEffect(() => {
+    let cancelled = false;
+    const initializeProjects = async () => {
+      try {
+        let summaries = await listProjects();
+        if (summaries.length === 0) {
+          await saveProject(initialProjectRef.current!);
+          summaries = await listProjects();
+        }
+        const project = summaries[0] ? await loadProject(summaries[0].id) : null;
+        if (!cancelled && project) {
+          applyProjectSnapshot(project);
+          setProjects(summaries);
+          setSaveStatus('saved');
+          setIsProjectReady(true);
+        }
+      } catch (error: any) {
+        if (!cancelled) {
+          setErrorMsg(error?.message || 'No se pudieron abrir los proyectos locales.');
+          setSaveStatus('error');
+          setIsProjectReady(true);
+        }
+      }
+    };
+    initializeProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isProjectReady) return;
+    setSaveStatus('saving');
+    const timer = window.setTimeout(async () => {
+      try {
+        const saved = await saveProject(makeProjectSnapshot());
+        setProjectUpdatedAt(saved.updatedAt);
+        await refreshProjects();
+        setSaveStatus('saved');
+      } catch (error: any) {
+        setSaveStatus('error');
+        setErrorMsg(error?.message || 'No se pudo guardar el proyecto localmente.');
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [
+    isProjectReady,
+    projectId,
+    projectName,
+    appMode,
+    text,
+    scriptText,
+    selectedVoice,
+    selectedEmotion,
+    selectedAccent,
+    useTargetDuration,
+    targetDurationSeconds,
+    isMultiSpeaker,
+    speakers,
+    history,
+  ]);
+
+  const persistCurrentProject = async () => {
+    if (!isProjectReady) return null;
+    setSaveStatus('saving');
+    const saved = await saveProject(makeProjectSnapshot());
+    setProjectUpdatedAt(saved.updatedAt);
+    setSaveStatus('saved');
+    return saved;
+  };
+
+  const handleSelectProject = async (id: string) => {
+    if (id === projectId) return;
+    try {
+      await persistCurrentProject();
+      const project = await loadProject(id);
+      if (project) applyProjectSnapshot(project);
+      await refreshProjects();
+    } catch (error: any) {
+      setErrorMsg(error?.message || 'No se pudo abrir el proyecto.');
+    }
+  };
+
+  const handleCreateProject = async () => {
+    try {
+      await persistCurrentProject();
+      const project = await saveProject(createBlankProject(`Proyecto ${projects.length + 1}`));
+      applyProjectSnapshot(project);
+      await refreshProjects();
+    } catch (error: any) {
+      setErrorMsg(error?.message || 'No se pudo crear el proyecto.');
+    }
+  };
+
+  const handleDeleteProject = async () => {
+    try {
+      await deleteProject(projectId);
+      const remaining = await listProjects();
+      if (remaining.length > 0) {
+        const project = await loadProject(remaining[0].id);
+        if (project) applyProjectSnapshot(project);
+      } else {
+        const project = await saveProject(createBlankProject('Mi primer proyecto'));
+        applyProjectSnapshot(project);
+      }
+      await refreshProjects();
+    } catch (error: any) {
+      setErrorMsg(error?.message || 'No se pudo eliminar el proyecto.');
+    }
+  };
+
+  const handleExportProject = async () => {
+    try {
+      const saved = await persistCurrentProject();
+      if (!saved) return;
+      const blob = await exportProject(saved);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${saved.name.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'proyecto'}.tav.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (error: any) {
+      setErrorMsg(error?.message || 'No se pudo exportar el proyecto.');
+    }
+  };
+
+  const handleImportProject = async (file: File) => {
+    try {
+      await persistCurrentProject();
+      const project = await importProject(file);
+      applyProjectSnapshot(project);
+      await refreshProjects();
+    } catch (error: any) {
+      setErrorMsg(error?.message || 'No se pudo importar el proyecto.');
+    }
+  };
 
   // Check backend server health
   useEffect(() => {
@@ -68,9 +276,24 @@ export default function App() {
     checkServer();
   }, []);
 
+  useEffect(() => {
+    const checkAuthentication = async () => {
+      try {
+        const response = await fetch('/api/auth/status');
+        const data = await response.json();
+        setAuthStatus(data.required && !data.authenticated ? 'required' : 'granted');
+      } catch {
+        // Projects remain available offline even though new audio cannot be generated.
+        setAuthStatus('granted');
+      }
+    };
+    checkAuthentication();
+  }, []);
+
   const handleSelectTemplate = (template: SampleTemplate) => {
     if (template.isScriptMode) {
       setAppMode('script');
+      if (template.scriptContent) setScriptText(template.scriptContent);
       return;
     }
     setAppMode('standard');
@@ -137,7 +360,7 @@ export default function App() {
         throw new Error(data.error || 'Ocurrió un error al sintetizar la voz.');
       }
 
-      const { blobUrl, duration, speedFactor } = base64ToWavBlob(
+      const { blob, blobUrl, duration, speedFactor } = base64ToWavBlob(
         data.audioBase64,
         data.mimeType || 'audio/pcm;rate=24000',
         activeTargetDuration
@@ -153,6 +376,7 @@ export default function App() {
         speedFactor,
         isMultiSpeaker,
         speakers: isMultiSpeaker ? [...speakers] : undefined,
+        audioBlob: blob,
         audioUrl: blobUrl,
         durationSeconds: duration,
         createdAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -183,10 +407,41 @@ export default function App() {
     setCurrentAudio(null);
   };
 
+  if (authStatus === 'checking') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-sm font-semibold text-slate-500">
+        Preparando Texto a Voz…
+      </div>
+    );
+  }
+
+  if (authStatus === 'required') {
+    return <LoginScreen onAuthenticated={() => setAuthStatus('granted')} />;
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans flex flex-col selection:bg-indigo-500 selection:text-white">
       {/* Header */}
       <Header serverStatus={serverStatus} />
+
+      {isProjectReady ? (
+        <ProjectBar
+          projects={projects}
+          currentProjectId={projectId}
+          projectName={projectName}
+          saveStatus={saveStatus}
+          onSelect={handleSelectProject}
+          onNameChange={setProjectName}
+          onCreate={handleCreateProject}
+          onDelete={handleDeleteProject}
+          onExport={handleExportProject}
+          onImport={handleImportProject}
+        />
+      ) : (
+        <div className="border-b border-slate-200 bg-white py-3 text-center text-xs font-semibold text-slate-500">
+          Abriendo proyectos locales…
+        </div>
+      )}
 
       {/* Main Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -202,7 +457,7 @@ export default function App() {
               }`}
             >
               <Video className="w-4 h-4" />
-              <span>🎬 Estudio de Guión para Vídeo (Marcas de Tiempo 3:00)</span>
+              <span>🎬 Estudio de guion para vídeo</span>
             </button>
 
             <button
@@ -255,6 +510,8 @@ export default function App() {
         {/* App Mode Conditional Views */}
         {appMode === 'script' ? (
           <VideoScriptStudio
+            scriptText={scriptText}
+            onScriptTextChange={setScriptText}
             selectedVoice={selectedVoice}
             selectedEmotion={selectedEmotion}
             selectedAccent={selectedAccent}
