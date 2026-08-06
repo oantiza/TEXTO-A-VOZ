@@ -10,6 +10,10 @@ dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_TEXT_LENGTH = 24_000;
+const LONG_FORM_TTS_THRESHOLD_CHARS = 1_000;
+const LONG_FORM_TTS_CHUNK_CHARS = 6_000;
+const FAST_TTS_MODEL = 'gemini-3.1-flash-tts-preview';
+const LONG_FORM_TTS_MODEL = 'gemini-2.5-pro-preview-tts';
 const RATE_LIMIT_PER_MINUTE = Math.max(1, Number(process.env.TTS_RATE_LIMIT_PER_MINUTE) || 30);
 const ALLOWED_VOICES = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] as const;
 const ALLOWED_EMOTIONS = [
@@ -222,7 +226,7 @@ async function startServer() {
 
   // API Routes
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", model: "gemini-3.1-flash-tts-preview" });
+    res.json({ status: "ok", model: FAST_TTS_MODEL, longFormModel: LONG_FORM_TTS_MODEL });
   });
 
   app.get('/api/auth/status', (req, res) => {
@@ -361,14 +365,21 @@ async function startServer() {
         });
       }
 
-      const textChunks = splitTextForStableTts(text);
+      const isLongForm = text.length > LONG_FORM_TTS_THRESHOLD_CHARS;
+      const selectedModel = isLongForm ? LONG_FORM_TTS_MODEL : FAST_TTS_MODEL;
+      const textChunks = splitTextForStableTts(
+        text,
+        isLongForm ? LONG_FORM_TTS_CHUNK_CHARS : LONG_FORM_TTS_THRESHOLD_CHARS
+      );
       const audioParts: Buffer[] = [];
       let outputMimeType = '';
       const numericTargetDuration = targetDuration === null || targetDuration === undefined
         ? null
         : Number(targetDuration);
 
-      console.log(`[Gemini TTS] ${text.length} caracteres en ${textChunks.length} fragmento(s) estable(s).`);
+      console.log(
+        `[Gemini TTS] Modelo ${selectedModel}: ${text.length} caracteres en ${textChunks.length} fragmento(s).`
+      );
 
       for (const [chunkIndex, textChunk] of textChunks.entries()) {
         const chunkTargetDuration = numericTargetDuration
@@ -401,7 +412,7 @@ async function startServer() {
           } and ${validatedSpeakers[1].name}. Keep exactly the configured voices and delivery.${durationInstruction} Speak only the transcript.\n\nTRANSCRIPT:\n${textChunk}`;
 
           response = await generateTTSWithRetry(ai, {
-            model: "gemini-3.1-flash-tts-preview",
+            model: selectedModel,
             contents: [{ parts: [{ text: promptText }] }],
             config: {
               responseModalities: [Modality.AUDIO],
@@ -418,11 +429,11 @@ async function startServer() {
             emotion,
             accent,
             chunkTargetDuration,
-            textChunks.length > 1
+            isLongForm || textChunks.length > 1
           );
 
           response = await generateTTSWithRetry(ai, {
-            model: "gemini-3.1-flash-tts-preview",
+            model: selectedModel,
             contents: [{ parts: [{ text: promptText }] }],
             config: {
               responseModalities: [Modality.AUDIO],
@@ -453,7 +464,8 @@ async function startServer() {
         audioBase64: combinedAudio.toString('base64'),
         mimeType: outputMimeType || "audio/pcm;rate=24000",
         segmentCount: textChunks.length,
-        stabilizedLongForm: textChunks.length > 1,
+        stabilizedLongForm: isLongForm,
+        model: selectedModel,
       });
     } catch (err: any) {
       const errStr = String(err?.message || err);
