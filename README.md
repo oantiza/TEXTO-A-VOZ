@@ -9,6 +9,7 @@ Aplicación en español para convertir texto y guiones de vídeo en locuciones, 
 - Diálogos con dos voces.
 - Duración objetivo con ajuste de tiempo que conserva el tono.
 - Estudio de guiones con capítulos y marcas de tiempo.
+- Formato de producción Markdown `HH:MM:SS:FF` con sincronización exacta a 30 fps.
 - Importación de TXT, Markdown, SRT, VTT y DOCX.
 - Exportación de audio WAV y MP3 y subtítulos SRT/VTT.
 - Proyectos guardados automáticamente en el navegador, incluidos los audios.
@@ -60,6 +61,26 @@ Abre [http://localhost:3000](http://localhost:3000).
 - Usa **Importar** para recuperar esa copia en este u otro navegador.
 - Los datos locales dependen del perfil del navegador. Antes de limpiar sus datos, crea una copia.
 - Para un guion de vídeo, usa marcas `[MM:SS]` por frase y rangos `MM:SS–MM:SS · TÍTULO` para los capítulos.
+- Para producción a 30 fps, el formato recomendado y prioritario es:
+
+```markdown
+**Duración de diseño:** `00:00:19:00`
+**Frecuencia:** 30 fps constantes
+
+## P01 · `00:00:00:00–00:00:07:00` · 7 segundos
+
+Primera frase que debe ocupar exactamente este intervalo.
+
+## P02 · `00:00:07:00–00:00:19:00` · 12 segundos
+
+Segunda frase.
+
+## Pronunciación
+
+- `TAE`: leer **te-a-e**.
+```
+
+La aplicación solo convierte en voz los bloques temporizados. Los avisos escritos y demás apéndices quedan fuera. Las reglas de pronunciación se aplican al audio sin cambiar el texto visible ni los subtítulos. Para respetar cada entrada y salida hay que usar **Generar sincronizado exacto**; el modo de una sola petición queda desactivado en este formato porque únicamente puede aproximar la duración total.
 
 ## Versión de producción
 

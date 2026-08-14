@@ -49,6 +49,10 @@ export interface ScriptLine {
   endSec: number;
   targetDurationSec: number;
   text: string;
+  /** Text sent to the voice model when pronunciation differs from the visible subtitle. */
+  spokenText?: string;
+  /** Original video timecode, when the source uses HH:MM:SS:FF. */
+  sourceTimecode?: string;
   audioUrl?: string;
   speedFactor?: number;
   actualDurationSec?: number;
@@ -71,6 +75,8 @@ export interface ParsedScript {
   voiceInfo: string;
   totalDurationSec: number;
   chapters: ScriptChapter[];
+  sourceFormat?: 'frame-timed-markdown' | 'subtitles' | 'timestamped' | 'automatic';
+  frameRate?: number;
 }
 
 export interface SampleTemplate {

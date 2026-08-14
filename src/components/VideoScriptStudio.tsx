@@ -15,6 +15,7 @@ import {
   parseVideoScript,
   scriptToSrt,
   scriptToVtt,
+  secondsToFrameTimecode,
   secondsToTimeString,
 } from '../utils/scriptParser';
 import { base64ToWavBlob, wavBlobToMp3Blob } from '../utils/audio';
@@ -164,6 +165,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   // Count lines
   const allLines = parsedScript.chapters.flatMap((c) => c.lines);
   const generatedLinesCount = allLines.filter((l) => l.audioUrl).length;
+  const isFrameTimedScript = parsedScript.sourceFormat === 'frame-timed-markdown';
+  const speechTextFor = (line: ScriptLine) => line.spokenText || line.text;
 
   const updateLineState = (lineId: string, changes: Partial<ScriptLine>) => {
     setParsedScript((prev) => ({
@@ -192,7 +195,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     setGlobalError(null);
 
     const fullText = parsedScript.chapters
-      .map((chap) => chap.lines.map((l) => l.text).join(' '))
+      .map((chap) => chap.lines.map(speechTextFor).join(' '))
       .join('\n\n');
 
     try {
@@ -259,7 +262,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       return updated;
     });
 
-    const chapterText = chapter.lines.map((l) => l.text).join(' ');
+    const chapterText = chapter.lines.map(speechTextFor).join(' ');
     const chapterDuration = chapter.lines.reduce((acc, l) => acc + l.targetDurationSec, 0);
 
     try {
@@ -272,6 +275,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           emotion: selectedEmotion,
           accent: selectedAccent,
           targetDuration: chapterDuration <= 300 ? chapterDuration : undefined,
+          continuousNarration: isFrameTimedScript,
           isMultiSpeaker,
           speakers: isMultiSpeaker ? speakers : undefined,
         }),
@@ -282,7 +286,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
       const { blobUrl } = base64ToWavBlob(
         data.audioBase64,
-        data.mimeType || 'audio/pcm;rate=24000'
+        data.mimeType || 'audio/pcm;rate=24000',
+        chapterDuration
       );
 
       setParsedScript((prev) => {
@@ -326,11 +331,14 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          text: line.text,
+          text: speechTextFor(line),
           voice: selectedVoice,
           emotion: selectedEmotion,
           accent: selectedAccent,
-          targetDuration: undefined,
+          // Ask Gemini to approach the slot first; the local pitch-preserving
+          // correction below then only has to make a small exact adjustment.
+          targetDuration: line.targetDurationSec,
+          continuousNarration: isFrameTimedScript,
           isMultiSpeaker,
           speakers: isMultiSpeaker ? speakers : undefined,
         }),
@@ -403,11 +411,12 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              text: line.text,
+              text: speechTextFor(line),
               voice: selectedVoice,
               emotion: selectedEmotion,
               accent: selectedAccent,
-              targetDuration: undefined,
+              targetDuration: line.targetDurationSec,
+              continuousNarration: isFrameTimedScript,
               isMultiSpeaker,
               speakers: isMultiSpeaker ? speakers : undefined,
             }),
@@ -678,7 +687,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             placeholder="Pega aquí tu guión con marcas de tiempo como [00:00] o 00:00–00:14..."
           />
           <p className="text-[11px] text-slate-500">
-            Formato soportado: Las líneas que empiezan por `[MM:SS]` o `MM:SS` se interpretarán como inicios de frase. Las cabeceras como `00:00–00:14 · TITULO` crean capítulos.
+            Formato principal: bloques Markdown como `## P01 · 00:00:00:00–00:00:07:00 · 7 segundos`.
+            También se admiten `[MM:SS]`, SRT y VTT. Las notas posteriores de pronunciación se aplican a la voz sin modificar los subtítulos.
           </p>
         </div>
       )}
@@ -769,6 +779,20 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       )}
 
       {/* Action Bar: Batch Synthesize Options */}
+      {isFrameTimedScript && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 text-xs sm:text-sm text-emerald-900 flex items-start gap-3 shadow-sm">
+          <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+          <div>
+            <span className="font-bold block">Formato de producción reconocido</span>
+            <p className="leading-relaxed">
+              {allLines.length} bloques con código HH:MM:SS:FF a {parsedScript.frameRate} fps. Usa
+              «Generar sincronizado» para colocar cada frase exactamente en su intervalo y crear una pista máster de{' '}
+              {secondsToFrameTimecode(parsedScript.totalDurationSec, parsedScript.frameRate)}.
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4">
         <div className="space-y-1 text-center md:text-left">
           <h3 className="text-sm font-bold text-slate-900 flex items-center justify-center md:justify-start space-x-2">
@@ -776,7 +800,9 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             <span>Opciones de Generación de Locución</span>
           </h3>
           <p className="text-xs text-slate-500">
-            Sintetiza todo el documento en 1 solo paso para ahorrar peticiones, o genera frase por frase para sincronización milimétrica.
+            {isFrameTimedScript
+              ? 'La generación sincronizada respeta el inicio y el final de cada bloque a nivel de fotograma.'
+              : 'Sintetiza todo el documento en 1 solo paso para ahorrar peticiones, o genera frase por frase para sincronización milimétrica.'}
           </p>
         </div>
 
@@ -784,7 +810,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           {/* Direct 1-Request Generation */}
           <button
             onClick={generateFullScriptSingleRequest}
-            disabled={isGeneratingAll || allLines.length === 0}
+            disabled={isGeneratingAll || allLines.length === 0 || isFrameTimedScript}
+            title={isFrameTimedScript ? 'Este modo solo ajusta la duración total y no puede respetar cada código de tiempo.' : undefined}
             className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
           >
             {isGeneratingAll ? (
@@ -792,7 +819,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             ) : (
               <Sparkles className="w-4 h-4" />
             )}
-            <span>🎙️ Generar Guión Completo (1 Petición - Rápido)</span>
+            <span>{isFrameTimedScript ? '1 petición (no compatible con tiempos exactos)' : '🎙️ Generar Guión Completo (1 Petición - Rápido)'}</span>
           </button>
 
           {/* Sentence by Sentence Batch */}
@@ -810,7 +837,11 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
               <>
                 <Layers className="w-4 h-4" />
                 <span>
-                  {generatedLinesCount > 0 ? 'Regenerar Frase por Frase' : '⚡ Generar Frase por Frase'}
+                  {generatedLinesCount > 0
+                    ? 'Regenerar sincronizado'
+                    : isFrameTimedScript
+                      ? '⚡ Generar sincronizado exacto'
+                      : '⚡ Generar Frase por Frase'}
                 </span>
               </>
             )}
@@ -852,7 +883,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                 <div>
                   <h4 className="text-sm font-bold text-slate-900">{chap.title}</h4>
                   <span className="text-[11px] font-medium text-slate-500">
-                    Marca temporal: <span className="font-mono text-indigo-700 font-bold">{chap.timeRange}</span> · {chap.lines.length} frases
+                    Marca temporal: <span className="font-mono text-indigo-700 font-bold">{chap.timeRange}</span> · {chap.lines.length} {chap.lines.length === 1 ? 'frase' : 'frases'}
                   </span>
                 </div>
               </div>
@@ -910,7 +941,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                     <div className="flex items-start space-x-3 flex-1 min-w-0">
                       {/* Timestamp Badge */}
                       <div className="bg-slate-100 px-2.5 py-1 rounded-lg font-mono text-xs font-bold text-slate-700 shrink-0 border border-slate-200">
-                        [{secondsToTimeString(line.startSec)}]
+                        [{line.sourceTimecode?.split('–')[0] || secondsToTimeString(line.startSec)}]
                       </div>
 
                       <div className="space-y-1 flex-1">
@@ -920,7 +951,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                         <div className="flex items-center flex-wrap gap-2 text-[11px] text-slate-500">
                           <span className="inline-flex items-center text-indigo-700 font-semibold bg-indigo-50 px-2 py-0.5 rounded">
                             <Clock className="w-3 h-3 mr-1 text-indigo-600" />
-                            Duración asignada: {line.targetDurationSec} seg
+                            Duración asignada: {Number(line.targetDurationSec.toFixed(3))} seg
                           </span>
                           {line.speedFactor && line.speedFactor !== 1 && (
                             <span className="bg-purple-100 text-purple-700 font-bold px-2 py-0.5 rounded">
