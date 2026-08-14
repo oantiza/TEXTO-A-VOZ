@@ -309,6 +309,7 @@ async function startServer() {
         emotion = "natural",
         accent = "neutral",
         targetDuration = null,
+        continuousNarration = false,
         isMultiSpeaker = false,
         speakers = [],
       } = req.body;
@@ -429,7 +430,7 @@ async function startServer() {
             emotion,
             accent,
             chunkTargetDuration,
-            isLongForm || textChunks.length > 1
+            Boolean(continuousNarration) || isLongForm || textChunks.length > 1
           );
 
           response = await generateTTSWithRetry(ai, {

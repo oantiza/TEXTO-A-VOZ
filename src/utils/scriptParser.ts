@@ -27,6 +27,164 @@ export function secondsToTimeString(totalSeconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+/** Converts an HH:MM:SS:FF production timecode into seconds. */
+export function frameTimecodeToSeconds(timecode: string, frameRate = 30): number {
+  const match = timecode.trim().match(/^(\d{2}):(\d{2}):(\d{2}):(\d{2})$/);
+  if (!match || !Number.isFinite(frameRate) || frameRate <= 0) return 0;
+  const [, hours, minutes, seconds, frames] = match.map(Number);
+  if (minutes > 59 || seconds > 59 || frames >= frameRate) return 0;
+  return hours * 3600 + minutes * 60 + seconds + frames / frameRate;
+}
+
+/** Converts seconds into the HH:MM:SS:FF notation used by production scripts. */
+export function secondsToFrameTimecode(totalSeconds: number, frameRate = 30): string {
+  const totalFrames = Math.round(Math.max(0, totalSeconds) * frameRate);
+  const frames = totalFrames % frameRate;
+  const totalWholeSeconds = Math.floor(totalFrames / frameRate);
+  const seconds = totalWholeSeconds % 60;
+  const totalMinutes = Math.floor(totalWholeSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  return [hours, minutes, seconds, frames]
+    .map((value) => value.toString().padStart(2, '0'))
+    .join(':');
+}
+
+function cleanMarkdownSpeechText(value: string): string {
+  return value
+    .replace(/^>\s?/gm, '')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[*_~`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function applyPronunciations(
+  text: string,
+  pronunciations: Array<{ term: string; spoken: string }>
+): string {
+  return pronunciations.reduce((result, { term, spoken }) => {
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return result.replace(
+      new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'giu'),
+      spoken
+    );
+  }, text);
+}
+
+interface FrameTimedBlock {
+  label: string;
+  startCode: string;
+  endCode: string;
+  startSec: number;
+  endSec: number;
+  text: string;
+}
+
+/**
+ * Parses NUVIA production Markdown with blocks such as:
+ * ## P01 · `00:00:00:00–00:00:07:00` · 7 segundos
+ *
+ * Non-spoken appendices (educational notice, pronunciation notes, etc.) are
+ * deliberately excluded. Pronunciation mappings are kept separately through
+ * ScriptLine.spokenText so subtitle text remains unchanged.
+ */
+function parseFrameTimedMarkdown(scriptText: string): ParsedScript | null {
+  const normalized = scriptText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  const fpsMatch = normalized.match(/\*\*Frecuencia:\*\*\s*(\d+(?:[.,]\d+)?)\s*fps/i);
+  const frameRate = fpsMatch ? Number(fpsMatch[1].replace(',', '.')) : 30;
+  const blockHeaderPattern = /^##\s+(.+?)\s*·\s*`?(\d{2}:\d{2}:\d{2}:\d{2})\s*[–—-]\s*(\d{2}:\d{2}:\d{2}:\d{2})`?(?:\s*·.*)?$/;
+  const lines = normalized.split('\n');
+  const blocks: FrameTimedBlock[] = [];
+
+  for (let index = 0; index < lines.length; index++) {
+    const header = lines[index].trim().match(blockHeaderPattern);
+    if (!header) continue;
+
+    const startCode = header[2];
+    const endCode = header[3];
+    const startSec = frameTimecodeToSeconds(startCode, frameRate);
+    const endSec = frameTimecodeToSeconds(endCode, frameRate);
+    const body: string[] = [];
+
+    for (index += 1; index < lines.length; index++) {
+      const candidate = lines[index].trim();
+      if (/^#{1,6}\s+/.test(candidate) || blockHeaderPattern.test(candidate)) {
+        index -= 1;
+        break;
+      }
+      if (candidate === '---') continue;
+      if (candidate) body.push(candidate);
+    }
+
+    const text = cleanMarkdownSpeechText(body.join(' '));
+    if (text && endSec > startSec) {
+      blocks.push({
+        label: cleanMarkdownSpeechText(header[1]),
+        startCode,
+        endCode,
+        startSec,
+        endSec,
+        text,
+      });
+    }
+  }
+
+  if (blocks.length === 0) return null;
+
+  const pronunciationSection = normalized.match(
+    /(?:^|\n)##\s+Pronunciaci[oó]n\s*\n([\s\S]*?)(?=\n##\s+|\n---|$)/i
+  )?.[1] ?? '';
+  const pronunciations = pronunciationSection
+    .split('\n')
+    .map((line) => {
+      const mapping = line.match(
+        /^\s*-\s*`?([^`:]+)`?\s*:\s*(?:leer|pronunciar)\s+\*\*([^*]+)\*\*/i
+      );
+      return mapping
+        ? { term: cleanMarkdownSpeechText(mapping[1]), spoken: cleanMarkdownSpeechText(mapping[2]) }
+        : null;
+    })
+    .filter((mapping): mapping is { term: string; spoken: string } => Boolean(mapping?.term && mapping?.spoken));
+
+  const h1Title = normalized.match(/^#\s+(.+)$/m)?.[1];
+  const tone = normalized.match(/\*\*Tono:\*\*\s*([^\n]+)/i)?.[1]?.trim();
+  const designDurationCode = normalized.match(/\*\*Duraci[oó]n de dise[ñn]o:\*\*\s*`(\d{2}:\d{2}:\d{2}:\d{2})`/i)?.[1];
+  const maxBlockEnd = Math.max(...blocks.map((block) => block.endSec));
+  const designDuration = designDurationCode
+    ? frameTimecodeToSeconds(designDurationCode, frameRate)
+    : 0;
+
+  const chapters: ScriptChapter[] = blocks.map((block, index) => {
+    const spokenText = applyPronunciations(block.text, pronunciations);
+    const line: ScriptLine = {
+      id: `line_${index + 1}`,
+      startSec: block.startSec,
+      endSec: block.endSec,
+      targetDurationSec: block.endSec - block.startSec,
+      text: block.text,
+      spokenText: spokenText === block.text ? undefined : spokenText,
+      sourceTimecode: `${block.startCode}–${block.endCode}`,
+    };
+    return {
+      id: `chap_${index + 1}`,
+      title: block.label,
+      timeRange: `${block.startCode} – ${block.endCode}`,
+      lines: [line],
+    };
+  });
+
+  return {
+    title: cleanMarkdownSpeechText(h1Title || 'Locución con código de tiempo'),
+    voiceInfo: [tone, `${frameRate} fps`].filter(Boolean).join(' · '),
+    totalDurationSec: Math.max(maxBlockEnd, designDuration),
+    chapters,
+    sourceFormat: 'frame-timed-markdown',
+    frameRate,
+  };
+}
+
 /**
  * Default sample script provided by Nuvia Academy - Dónde crece el dinero
  */
@@ -209,6 +367,9 @@ export function parseSubtitleCues(scriptText: string): SubtitleCue[] {
  * Parses script text containing timestamps like [00:00], [01:26] and chapter section headers.
  */
 export function parseVideoScript(scriptText: string): ParsedScript {
+  const frameTimedMarkdown = parseFrameTimedMarkdown(scriptText);
+  if (frameTimedMarkdown) return frameTimedMarkdown;
+
   const subtitleCues = parseSubtitleCues(scriptText);
   if (subtitleCues.length > 0) {
     const totalDurationSec = Math.max(...subtitleCues.map((cue) => cue.endSec));
@@ -231,6 +392,7 @@ export function parseVideoScript(scriptText: string): ParsedScript {
           lines,
         },
       ],
+      sourceFormat: 'subtitles',
     };
   }
 
@@ -243,6 +405,7 @@ export function parseVideoScript(scriptText: string): ParsedScript {
   const chapters: ScriptChapter[] = [];
   let currentChapter: ScriptChapter | null = null;
   const rawLinesWithTimes: { startSec: number; text: string; chapterTitle?: string }[] = [];
+  let hasExplicitTimestamps = false;
 
   // 1. Scan headers & header metadata
   for (const rawLine of linesRaw) {
@@ -279,6 +442,7 @@ export function parseVideoScript(scriptText: string): ParsedScript {
     // Check timestamp lines like "[00:00] Cien dólares..." or "00:00 Cien dólares..."
     const timestampMatch = trimmed.match(/^\[?(\d{2}:\d{2})\]?\s*(.+)/);
     if (timestampMatch) {
+      hasExplicitTimestamps = true;
       const startSec = timeStringToSeconds(timestampMatch[1]);
       const lineText = timestampMatch[2].trim();
       rawLinesWithTimes.push({
@@ -394,6 +558,7 @@ export function parseVideoScript(scriptText: string): ParsedScript {
     voiceInfo,
     totalDurationSec,
     chapters,
+    sourceFormat: hasExplicitTimestamps ? 'timestamped' : 'automatic',
   };
 }
 
