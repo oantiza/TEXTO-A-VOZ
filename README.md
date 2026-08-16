@@ -7,11 +7,12 @@ Aplicación en español para convertir texto y guiones de vídeo en locuciones, 
 - Generación con cinco voces y varios estilos expresivos.
 - Preferencia de acento castellano de España.
 - Diálogos con dos voces.
-- Duración objetivo con ajuste de tiempo que conserva el tono.
+- Lectura natural continua como flujo recomendado para vídeo.
+- Ajuste a una duración objetivo disponible como modo alternativo.
 - Estudio de guiones con capítulos y marcas de tiempo.
 - Formato de producción Markdown `HH:MM:SS:FF` con sincronización exacta a 30 fps.
 - Importación de TXT, Markdown, SRT, VTT y DOCX.
-- Exportación de audio WAV y MP3 y subtítulos SRT/VTT.
+- Exportación de producción WAV a 48 kHz, MP3 y subtítulos SRT/VTT.
 - Proyectos guardados automáticamente en el navegador, incluidos los audios.
 - Copias completas de proyecto en archivos `.tav.json`.
 - Aplicación web instalable (PWA) y acceso privado opcional mediante contraseña.
@@ -80,7 +81,11 @@ Segunda frase.
 - `TAE`: leer **te-a-e**.
 ```
 
-La aplicación solo convierte en voz los bloques temporizados. Los avisos escritos y demás apéndices quedan fuera. Las reglas de pronunciación se aplican al audio sin cambiar el texto visible ni los subtítulos. Para respetar cada entrada y salida hay que usar **Generar sincronizado exacto**; el modo de una sola petición queda desactivado en este formato porque únicamente puede aproximar la duración total.
+La aplicación solo convierte en voz los bloques temporizados. Los avisos escritos y demás apéndices quedan fuera. Las reglas de pronunciación se aplican al audio sin cambiar el texto visible ni los subtítulos.
+
+Para el máster final, usa **Natural por bloques · Flash**. Cada bloque se interpreta a velocidad natural con la misma voz, sin estirado temporal. La aplicación recorta únicamente el silencio sobrante de los extremos, iguala el nivel con suavidad, crea pausas breves y exporta la temporización real a 30 fps. Después la animación se reajusta a esos tiempos. **Ajustar voz a intervalos** se conserva como alternativa para piezas que necesiten entradas y salidas rígidas, pero puede modificar la cadencia y debe revisarse auditivamente. La petición continua de larga duración queda como modo experimental.
+
+Gemini entrega actualmente PCM nativo a 24 kHz. La aplicación realiza una única conversión de alta calidad y descarga el WAV de producción a 48 kHz, mono y 16 bits, con margen de pico para la mezcla.
 
 ## Versión de producción
 

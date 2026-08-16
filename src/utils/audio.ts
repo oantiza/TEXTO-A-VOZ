@@ -1,3 +1,12 @@
+import { Mp3Encoder } from '@breezystack/lamejs';
+
+export const PRODUCTION_SAMPLE_RATE = 48_000;
+
+function getSampleRateFromMimeType(mimeType: string): number {
+  const match = mimeType.match(/(?:^|[;,\s])rate=(\d+)/i);
+  return match ? Number(match[1]) : 24_000;
+}
+
 /**
  * Changes PCM duration with a lightweight WSOLA-style overlap algorithm.
  * Frames are repositioned instead of resampling individual samples, which keeps
@@ -102,14 +111,112 @@ export function timeStretchPcm16(
 }
 
 /**
+ * Converts mono PCM16 to the production sample rate. Gemini currently returns
+ * 24 kHz PCM, while video editors and delivery masters expect 48 kHz. The
+ * common 2x path uses band-limited Lanczos interpolation instead of duplicating
+ * samples or changing only the WAV header.
+ */
+export function resamplePcm16(
+  pcmBytes: Uint8Array,
+  sourceSampleRate: number,
+  targetSampleRate = PRODUCTION_SAMPLE_RATE
+): Uint8Array {
+  if (sourceSampleRate <= 0 || targetSampleRate <= 0) {
+    throw new Error('La frecuencia de muestreo debe ser mayor que cero.');
+  }
+  if (sourceSampleRate === targetSampleRate) return pcmBytes.slice();
+
+  const sourceSamples = Math.floor(pcmBytes.byteLength / 2);
+  if (sourceSamples === 0) return new Uint8Array();
+
+  const sourceView = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  const input = new Float64Array(sourceSamples);
+  for (let index = 0; index < sourceSamples; index++) {
+    input[index] = sourceView.getInt16(index * 2, true);
+  }
+
+  const targetSamples = Math.max(1, Math.round((sourceSamples * targetSampleRate) / sourceSampleRate));
+  const output = new Uint8Array(targetSamples * 2);
+  const outputView = new DataView(output.buffer);
+  const radius = 4;
+  const sinc = (value: number) => {
+    if (Math.abs(value) < 1e-9) return 1;
+    const angle = Math.PI * value;
+    return Math.sin(angle) / angle;
+  };
+
+  for (let targetIndex = 0; targetIndex < targetSamples; targetIndex++) {
+    const sourcePosition = (targetIndex * sourceSampleRate) / targetSampleRate;
+    const nearestInteger = Math.round(sourcePosition);
+    let sample: number;
+
+    if (Math.abs(sourcePosition - nearestInteger) < 1e-9 && nearestInteger < sourceSamples) {
+      sample = input[nearestInteger];
+    } else {
+      const center = Math.floor(sourcePosition);
+      let weightedSample = 0;
+      let totalWeight = 0;
+      for (let sourceIndex = center - radius + 1; sourceIndex <= center + radius; sourceIndex++) {
+        const clampedIndex = Math.max(0, Math.min(sourceSamples - 1, sourceIndex));
+        const distance = sourcePosition - sourceIndex;
+        const weight = sinc(distance) * sinc(distance / radius);
+        weightedSample += input[clampedIndex] * weight;
+        totalWeight += weight;
+      }
+      sample = totalWeight === 0
+        ? input[Math.max(0, Math.min(sourceSamples - 1, center))]
+        : weightedSample / totalWeight;
+    }
+
+    outputView.setInt16(
+      targetIndex * 2,
+      Math.max(-32768, Math.min(32767, Math.round(sample))),
+      true
+    );
+  }
+
+  return output;
+}
+
+/** Reduces only excessive peaks, preserving the natural dynamics of the voice. */
+export function applyPeakCeilingPcm16(pcmBytes: Uint8Array, ceilingDbfs = -3): Uint8Array {
+  const sampleCount = Math.floor(pcmBytes.byteLength / 2);
+  if (sampleCount === 0) return new Uint8Array();
+  const sourceView = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  let peak = 0;
+  for (let index = 0; index < sampleCount; index++) {
+    peak = Math.max(peak, Math.abs(sourceView.getInt16(index * 2, true)));
+  }
+  const ceiling = 32767 * 10 ** (ceilingDbfs / 20);
+  if (peak <= ceiling || peak === 0) return pcmBytes.slice();
+
+  const gain = ceiling / peak;
+  const output = new Uint8Array(sampleCount * 2);
+  const outputView = new DataView(output.buffer);
+  for (let index = 0; index < sampleCount; index++) {
+    outputView.setInt16(index * 2, Math.round(sourceView.getInt16(index * 2, true) * gain), true);
+  }
+  return output;
+}
+
+/**
  * Converts Base64 audio returned by Gemini TTS into a playable WAV Blob URL.
  * When a target duration is provided, timing is adjusted without changing pitch.
  */
 export function base64ToWavBlob(
   base64Audio: string,
   mimeType: string = 'audio/pcm;rate=24000',
-  targetDurationSeconds?: number | null
-): { blob: Blob; blobUrl: string; duration: number; originalDuration: number; speedFactor: number } {
+  targetDurationSeconds?: number | null,
+  outputSampleRate = PRODUCTION_SAMPLE_RATE
+): {
+  blob: Blob;
+  blobUrl: string;
+  duration: number;
+  originalDuration: number;
+  speedFactor: number;
+  sampleRate: number;
+  sourceSampleRate: number;
+} {
   const binaryString = atob(base64Audio);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
@@ -118,12 +225,12 @@ export function base64ToWavBlob(
   }
 
   // Sample rate & parameters
-  const sampleRate = mimeType.includes('rate=') ? parseInt(mimeType.split('rate=')[1]) || 24000 : 24000;
+  const sourceSampleRate = getSampleRateFromMimeType(mimeType);
   const numChannels = 1;
   const bitsPerSample = 16;
 
   // Calculate raw PCM duration from Gemini
-  const origDurationSeconds = (len / (bitsPerSample / 8)) / sampleRate;
+  const origDurationSeconds = (len / (bitsPerSample / 8)) / sourceSampleRate;
 
   let finalPcmBytes = bytes;
   let finalDurationSeconds = origDurationSeconds;
@@ -132,14 +239,20 @@ export function base64ToWavBlob(
   // If target duration is explicitly requested (> 0.5s)
   if (targetDurationSeconds && targetDurationSeconds >= 0.5) {
     const origSamples = Math.floor(len / 2);
-    const targetSamples = Math.round(targetDurationSeconds * sampleRate);
+    const targetSamples = Math.round(targetDurationSeconds * sourceSampleRate);
 
     if (origSamples > 0 && targetSamples > 0 && Math.abs(origDurationSeconds - targetDurationSeconds) >= 0.05) {
       speedFactor = origDurationSeconds / targetDurationSeconds; // e.g. 12s orig / 10s target = 1.2x speed
-      finalPcmBytes = timeStretchPcm16(bytes, targetSamples, sampleRate);
+      finalPcmBytes = timeStretchPcm16(bytes, targetSamples, sourceSampleRate);
       finalDurationSeconds = targetDurationSeconds;
     }
   }
+
+  // Perform one production-rate conversion after any optional timing change,
+  // then leave safe headroom for EQ, music and effects in the video mix.
+  finalPcmBytes = resamplePcm16(finalPcmBytes, sourceSampleRate, outputSampleRate);
+  finalPcmBytes = applyPeakCeilingPcm16(finalPcmBytes);
+  finalDurationSeconds = finalPcmBytes.byteLength / 2 / outputSampleRate;
 
   const pcmLen = finalPcmBytes.length;
   const wavHeader = new ArrayBuffer(44);
@@ -156,8 +269,8 @@ export function base64ToWavBlob(
   view.setUint32(16, 16, true); // Subchunk1Size for PCM
   view.setUint16(20, 1, true); // AudioFormat 1 = PCM
   view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true); // ByteRate
+  view.setUint32(24, outputSampleRate, true);
+  view.setUint32(28, outputSampleRate * numChannels * (bitsPerSample / 8), true); // ByteRate
   view.setUint16(32, numChannels * (bitsPerSample / 8), true); // BlockAlign
   view.setUint16(34, bitsPerSample, true);
 
@@ -178,6 +291,8 @@ export function base64ToWavBlob(
     duration: Math.round(finalDurationSeconds * 10) / 10,
     originalDuration: Math.round(origDurationSeconds * 10) / 10,
     speedFactor: Math.round(speedFactor * 100) / 100,
+    sampleRate: outputSampleRate,
+    sourceSampleRate,
   };
 }
 
@@ -238,4 +353,3 @@ export function formatTime(seconds: number): string {
   const secs = Math.floor(seconds % 60);
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
-import { Mp3Encoder } from '@breezystack/lamejs';

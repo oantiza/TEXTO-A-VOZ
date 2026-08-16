@@ -129,6 +129,7 @@ function buildPromptText(
 
   if (continuingNarration) {
     instructions.push('Keep exactly the same configured voice identity, pitch range, accent, and delivery as every other segment of this continuous narration');
+    instructions.push('Use a smooth continuous educational delivery with short natural pauses; never sound clipped, fragmented, list-like, or separated into isolated announcements');
   }
 
   if (accent === 'spain') {

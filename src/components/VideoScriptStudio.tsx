@@ -10,6 +10,7 @@ import {
   GeneratedAudioItem,
 } from '../types';
 import {
+  combineNaturalScriptAudioSegments,
   combineScriptAudioSegments,
   DEFAULT_NUVIA_SCRIPT,
   parseVideoScript,
@@ -67,6 +68,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
   // Generation state
   const [isGeneratingAll, setIsGeneratingAll] = useState<boolean>(false);
+  const [generationMode, setGenerationMode] = useState<'none' | 'natural-blocks' | 'continuous' | 'exact'>('none');
   const [isCompilingMaster, setIsCompilingMaster] = useState<boolean>(false);
   const [progressCount, setProgressCount] = useState<number>(0);
   const [totalLinesCount, setTotalLinesCount] = useState<number>(0);
@@ -77,6 +79,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   const [masterAudioBlob, setMasterAudioBlob] = useState<Blob | null>(null);
   const [masterDurationSec, setMasterDurationSec] = useState<number | null>(null);
   const [masterIsPreciselySynced, setMasterIsPreciselySynced] = useState<boolean>(false);
+  const [masterTimingCsv, setMasterTimingCsv] = useState<string | null>(null);
   const [isConvertingMasterMp3, setIsConvertingMasterMp3] = useState<boolean>(false);
   const [isPlayingMaster, setIsPlayingMaster] = useState<boolean>(false);
   const [currentTimeSec, setCurrentTimeSec] = useState<number>(0);
@@ -192,6 +195,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   // Generate entire script audio in 1 single API call (consumes only 1 request quota)
   const generateFullScriptSingleRequest = async () => {
     setIsGeneratingAll(true);
+    setGenerationMode('continuous');
     setGlobalError(null);
 
     const fullText = parsedScript.chapters
@@ -207,9 +211,10 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           voice: selectedVoice,
           emotion: selectedEmotion,
           accent: selectedAccent,
-          // Let Gemini pace the whole narration naturally near the desired length.
-          // Long-form client-side stretching can accumulate artifacts at the tail.
-          targetDuration: parsedScript.totalDurationSec <= 300 ? parsedScript.totalDurationSec : undefined,
+          // Natural narration is the production master. The video is retimed to
+          // this delivery; the voice is never accelerated or padded to a slot.
+          targetDuration: null,
+          continuousNarration: true,
           isMultiSpeaker,
           speakers: isMultiSpeaker ? speakers : undefined,
         }),
@@ -227,6 +232,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       setMasterAudioBlob(blob);
       setMasterDurationSec(duration);
       setMasterIsPreciselySynced(false);
+      setMasterTimingCsv(null);
 
       if (onAddToHistory) {
         onAddToHistory({
@@ -247,6 +253,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       setGlobalError(err.message || 'Error al conectar con la API de voz');
     } finally {
       setIsGeneratingAll(false);
+      setGenerationMode('none');
     }
   };
 
@@ -381,9 +388,102 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     }
   };
 
+  // Generate every block naturally with the fast voice model. Unlike exact
+  // sync, this path never sends a target duration and never time-stretches PCM.
+  const handleGenerateNaturalScriptLines = async () => {
+    setIsGeneratingAll(true);
+    setGenerationMode('natural-blocks');
+    setGlobalError(null);
+    setProgressCount(0);
+    setTotalLinesCount(allLines.length);
+    setMasterTimingCsv(null);
+
+    const linesToProcess = parsedScript.chapters.flatMap((chapter) => chapter.lines).map((line) => ({
+      ...line,
+      audioUrl: undefined,
+      actualDurationSec: undefined,
+      speedFactor: 1,
+    }));
+
+    for (let index = 0; index < linesToProcess.length; index++) {
+      const line = linesToProcess[index];
+      setProgressCount(index + 1);
+      updateLineState(line.id, { isGenerating: true, error: undefined });
+      let success = false;
+      let attempts = 0;
+
+      while (!success && attempts < 3) {
+        attempts += 1;
+        try {
+          const response = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: speechTextFor(line),
+              voice: selectedVoice,
+              emotion: selectedEmotion,
+              accent: selectedAccent,
+              targetDuration: null,
+              continuousNarration: true,
+              isMultiSpeaker,
+              speakers: isMultiSpeaker ? speakers : undefined,
+            }),
+          });
+          const data = await response.json();
+
+          if (response.status === 429 || data.isQuotaExhausted) {
+            const waitTime = data.retryAfterSec || 15;
+            for (let second = waitTime; second > 0; second--) {
+              setGlobalError(`Cuota temporal de voz: reanudando en ${second} segundos…`);
+              await new Promise((resolve) => setTimeout(resolve, 1_000));
+            }
+            setGlobalError(null);
+            continue;
+          }
+          if (!response.ok) throw new Error(data.error || 'Error sintetizando el bloque natural');
+
+          const { blobUrl, duration } = base64ToWavBlob(
+            data.audioBase64,
+            data.mimeType || 'audio/pcm;rate=24000'
+          );
+          Object.assign(line, {
+            audioUrl: blobUrl,
+            actualDurationSec: duration,
+            speedFactor: 1,
+            isGenerating: false,
+            error: undefined,
+          });
+          updateLineState(line.id, {
+            audioUrl: blobUrl,
+            actualDurationSec: duration,
+            speedFactor: 1,
+            isGenerating: false,
+            error: undefined,
+          });
+          success = true;
+          setGlobalError(null);
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
+        } catch (error: any) {
+          if (attempts >= 3) {
+            const message = error.message || 'Error de conexión';
+            Object.assign(line, { isGenerating: false, error: message });
+            updateLineState(line.id, { isGenerating: false, error: message });
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 5_000));
+          }
+        }
+      }
+    }
+
+    setIsGeneratingAll(false);
+    setGenerationMode('none');
+    await compileNaturalMasterAudioTrack(linesToProcess);
+  };
+
   // Generate batch for all script lines with automatic retry for rate limits
   const handleGenerateAllScriptLines = async () => {
     setIsGeneratingAll(true);
+    setGenerationMode('exact');
     setGlobalError(null);
     setProgressCount(0);
     setTotalLinesCount(allLines.length);
@@ -480,12 +580,71 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     }
 
     setIsGeneratingAll(false);
+    setGenerationMode('none');
 
     // After generating all available lines, stitch continuous master audio track
     await compileMasterAudioTrack(linesToProcess);
   };
 
-  // Stitch master continuous WAV audio
+  const compileNaturalMasterAudioTrack = async (sourceLines: ScriptLine[]) => {
+    const linesWithAudio = sourceLines.filter((line) => line.audioUrl);
+    if (linesWithAudio.length === 0) {
+      setGlobalError('No hay bloques naturales válidos para unir.');
+      return;
+    }
+
+    setIsCompilingMaster(true);
+    setGlobalError(null);
+    try {
+      const { masterBlob, masterBlobUrl, durationSeconds, timings } =
+        await combineNaturalScriptAudioSegments(linesWithAudio);
+      setMasterAudioUrl(masterBlobUrl);
+      setMasterAudioBlob(masterBlob);
+      setMasterDurationSec(durationSeconds);
+      setMasterIsPreciselySynced(false);
+
+      const frameRate = parsedScript.frameRate || 30;
+      const csvRows = ['plan,start_tc,end_tc,start_frame,end_frame,duration_frames,duration_seconds'];
+      timings.forEach((timing, index) => {
+        const startFrame = Math.round(timing.startSec * frameRate);
+        const endFrame = index === timings.length - 1
+          ? Math.ceil(timing.endSec * frameRate)
+          : Math.round(timing.endSec * frameRate);
+        csvRows.push([
+          `P${String(index + 1).padStart(2, '0')}`,
+          secondsToFrameTimecode(startFrame / frameRate, frameRate),
+          secondsToFrameTimecode(endFrame / frameRate, frameRate),
+          startFrame,
+          endFrame,
+          endFrame - startFrame,
+          ((endFrame - startFrame) / frameRate).toFixed(3),
+        ].join(','));
+      });
+      setMasterTimingCsv(csvRows.join('\n'));
+
+      if (onAddToHistory) {
+        onAddToHistory({
+          id: `master_script_natural_blocks_${Date.now()}`,
+          text: `${parsedScript.title} (${linesWithAudio.length} bloques naturales Flash)`,
+          voice: selectedVoice,
+          emotion: selectedEmotion,
+          accent: selectedAccent,
+          durationSeconds,
+          audioBlob: masterBlob,
+          audioUrl: masterBlobUrl,
+          createdAt: new Date().toISOString(),
+          isMultiSpeaker,
+          speakers: isMultiSpeaker ? [...speakers] : undefined,
+        });
+      }
+    } catch (error: any) {
+      setGlobalError(error.message || 'No se han podido unir los bloques naturales.');
+    } finally {
+      setIsCompilingMaster(false);
+    }
+  };
+
+  // Stitch master continuous WAV audio with rigid source timecodes.
   const compileMasterAudioTrack = async (sourceLines?: ScriptLine[]) => {
     const linesWithAudio = (sourceLines ?? parsedScript.chapters.flatMap((c) => c.lines)).filter(
       (line) => line.audioUrl
@@ -507,6 +666,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
       setMasterAudioBlob(masterBlob);
       setMasterDurationSec(parsedScript.totalDurationSec);
       setMasterIsPreciselySynced(true);
+      setMasterTimingCsv(null);
 
       if (onAddToHistory) {
         onAddToHistory({
@@ -568,6 +728,17 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     } finally {
       setIsConvertingMasterMp3(false);
     }
+  };
+
+  const downloadMasterTiming = () => {
+    if (!masterTimingCsv) return;
+    const blob = new Blob([masterTimingCsv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'timing-locucion-natural-30fps.csv';
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   };
 
   return (
@@ -731,7 +902,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                 className="inline-flex items-center space-x-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-sm transition-all"
               >
                 <Download className="w-4 h-4" />
-                <span>Descargar WAV</span>
+                <span>Descargar WAV · 48 kHz</span>
               </a>
               {masterAudioBlob && (
                 <button
@@ -742,6 +913,16 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                 >
                   {isConvertingMasterMp3 ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                   <span>{isConvertingMasterMp3 ? 'Convirtiendo…' : 'Descargar MP3'}</span>
+                </button>
+              )}
+              {masterTimingCsv && (
+                <button
+                  type="button"
+                  onClick={downloadMasterTiming}
+                  className="inline-flex items-center space-x-1.5 px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl shadow-sm transition-all"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Descargar tiempos 30 fps</span>
                 </button>
               )}
             </div>
@@ -786,8 +967,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             <span className="font-bold block">Formato de producción reconocido</span>
             <p className="leading-relaxed">
               {allLines.length} bloques con código HH:MM:SS:FF a {parsedScript.frameRate} fps. Usa
-              «Generar sincronizado» para colocar cada frase exactamente en su intervalo y crear una pista máster de{' '}
-              {secondsToFrameTimecode(parsedScript.totalDurationSec, parsedScript.frameRate)}.
+              «Natural por bloques · Flash» para crear la locución maestra. Los códigos sirven como guía visual y la animación
+              se reajusta después a los tiempos reales de la voz. El ajuste exacto queda disponible solo como alternativa.
             </p>
           </div>
         </div>
@@ -801,25 +982,44 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           </h3>
           <p className="text-xs text-slate-500">
             {isFrameTimedScript
-              ? 'La generación sincronizada respeta el inicio y el final de cada bloque a nivel de fotograma.'
+              ? 'Recomendado: Kore Flash por bloques, sin estirar la voz, con pausas breves y nivel homogéneo.'
               : 'Sintetiza todo el documento en 1 solo paso para ahorrar peticiones, o genera frase por frase para sincronización milimétrica.'}
           </p>
         </div>
 
-        <div className="flex flex-col sm:flex-row items-center gap-2.5 w-full md:w-auto">
-          {/* Direct 1-Request Generation */}
+        <div className="flex flex-col sm:flex-row sm:flex-wrap items-center gap-2.5 w-full md:w-auto md:justify-end">
           <button
-            onClick={generateFullScriptSingleRequest}
-            disabled={isGeneratingAll || allLines.length === 0 || isFrameTimedScript}
-            title={isFrameTimedScript ? 'Este modo solo ajusta la duración total y no puede respetar cada código de tiempo.' : undefined}
+            onClick={handleGenerateNaturalScriptLines}
+            disabled={isGeneratingAll || isCompilingMaster || allLines.length === 0}
+            title="Genera cada bloque con Gemini Flash a velocidad natural y crea una sola pista continua, audible y sin estirado."
             className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
           >
-            {isGeneratingAll ? (
+            {generationMode === 'natural-blocks' ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-white" />
+                <span>Bloque {progressCount} de {totalLinesCount}…</span>
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-4 h-4" />
+                <span>🎙️ Natural por bloques · Flash</span>
+              </>
+            )}
+          </button>
+
+          {/* Direct 1-Request Generation: useful as a comparison, not the NUVIA master. */}
+          <button
+            onClick={generateFullScriptSingleRequest}
+            disabled={isGeneratingAll || allLines.length === 0}
+            title="Genera todo en una petición con el modelo de larga duración. Puede sonar bajo o fragmentado y no se recomienda para NUVIA."
+            className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-4 py-2.5 bg-slate-600 hover:bg-slate-700 text-white rounded-xl font-bold text-xs shadow-sm transition-all disabled:opacity-50"
+          >
+            {generationMode === 'continuous' ? (
               <Loader2 className="w-4 h-4 animate-spin text-white" />
             ) : (
-              <Sparkles className="w-4 h-4" />
+              <Volume2 className="w-4 h-4" />
             )}
-            <span>{isFrameTimedScript ? '1 petición (no compatible con tiempos exactos)' : '🎙️ Generar Guión Completo (1 Petición - Rápido)'}</span>
+            <span>Continuo experimental</span>
           </button>
 
           {/* Sentence by Sentence Batch */}
@@ -828,7 +1028,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             disabled={isGeneratingAll || isCompilingMaster || allLines.length === 0}
             className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
           >
-            {isGeneratingAll ? (
+            {generationMode === 'exact' ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin text-white" />
                 <span>Frase {progressCount} de {totalLinesCount}...</span>
@@ -840,7 +1040,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                   {generatedLinesCount > 0
                     ? 'Regenerar sincronizado'
                     : isFrameTimedScript
-                      ? '⚡ Generar sincronizado exacto'
+                      ? '⚠️ Ajustar voz a intervalos'
                       : '⚡ Generar Frase por Frase'}
                 </span>
               </>
