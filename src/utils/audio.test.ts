@@ -138,4 +138,46 @@ describe('timeStretchPcm16', () => {
     URL.revokeObjectURL(second.blobUrl);
     URL.revokeObjectURL(result.masterBlobUrl);
   });
+
+  it('absorbs short TTS edge silence when fitting a natural block', async () => {
+    const edgeSilenceSamples = Math.round(SAMPLE_RATE * 0.1);
+    const tone = createSineWave(220, 1);
+    const source = new Uint8Array(edgeSilenceSamples * 2 + tone.byteLength + edgeSilenceSamples * 2);
+    source.set(tone, edgeSilenceSamples * 2);
+    const base64 = Buffer.from(source).toString('base64');
+    const phrase = base64ToWavBlob(base64, 'audio/pcm;rate=24000');
+    const result = await combineNaturalScriptAudioSegments([
+      {
+        id: 'line-1',
+        startSec: 0,
+        endSec: 1.12,
+        targetDurationSec: 1.12,
+        text: 'Prueba con silencio técnico',
+        audioUrl: phrase.blobUrl,
+      },
+    ], { fitBlocksToTargets: true });
+
+    expect(result.durationSeconds).toBeCloseTo(1.12, 4);
+    expect(result.timings).toHaveLength(1);
+    URL.revokeObjectURL(phrase.blobUrl);
+    URL.revokeObjectURL(result.masterBlobUrl);
+  });
+
+  it('still rejects real speech that is longer than its target block', async () => {
+    const source = createSineWave(220, 1);
+    const base64 = Buffer.from(source).toString('base64');
+    const phrase = base64ToWavBlob(base64, 'audio/pcm;rate=24000');
+
+    await expect(combineNaturalScriptAudioSegments([
+      {
+        id: 'line-1',
+        startSec: 0,
+        endSec: 0.8,
+        targetDurationSec: 0.8,
+        text: 'Prueba demasiado larga',
+        audioUrl: phrase.blobUrl,
+      },
+    ], { fitBlocksToTargets: true })).rejects.toThrow('supera su intervalo');
+    URL.revokeObjectURL(phrase.blobUrl);
+  });
 });
