@@ -681,7 +681,11 @@ function prepareNaturalNarrationSegment(
   }
 
   if (firstActiveFrame < 0) return pcmBytes.slice();
-  const paddingSamples = Math.round(sampleRate * 0.1);
+  // Keep a short safety margin around detected speech, while discarding the
+  // longer technical silence that TTS providers commonly add to each phrase.
+  // Fifty milliseconds per edge is enough for the fade below and prevents
+  // harmless one- or two-frame overruns from blocking a timed master.
+  const paddingSamples = Math.round(sampleRate * 0.05);
   const firstSample = Math.max(0, firstActiveFrame * frameSamples - paddingSamples);
   const lastSample = Math.min(
     sampleCount,
