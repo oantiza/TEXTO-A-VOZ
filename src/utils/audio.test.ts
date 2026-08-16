@@ -177,7 +177,7 @@ describe('timeStretchPcm16', () => {
         text: 'Prueba demasiado larga',
         audioUrl: phrase.blobUrl,
       },
-    ], { fitBlocksToTargets: true })).rejects.toThrow('supera su intervalo');
+    ], { fitBlocksToTargets: true })).rejects.toThrow('no cabe en la duración del vídeo');
     URL.revokeObjectURL(phrase.blobUrl);
   });
 });

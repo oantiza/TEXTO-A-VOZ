@@ -598,6 +598,59 @@ export function calculateCenteredBlockPaddingSamples(
   };
 }
 
+export interface NaturalBlockPlacementInput {
+  startSample: number;
+  endSample: number;
+  speechSamples: number;
+}
+
+export interface NaturalBlockPlacement {
+  startSample: number;
+  endSample: number;
+}
+
+/**
+ * Centres each phrase around its visual interval and borrows unused silence
+ * from adjacent intervals when a phrase is slightly longer. Speech remains
+ * untouched and placements never overlap or exceed the master timeline.
+ */
+export function calculateNaturalBlockPlacements(
+  blocks: NaturalBlockPlacementInput[],
+  totalSamples: number
+): NaturalBlockPlacement[] {
+  if (blocks.length === 0) return [];
+
+  const starts = blocks.map(({ startSample, endSample, speechSamples }) => (
+    startSample + Math.floor((endSample - startSample - speechSamples) / 2)
+  ));
+
+  starts[0] = Math.max(0, starts[0]);
+  for (let index = 1; index < blocks.length; index++) {
+    const previousEnd = starts[index - 1] + blocks[index - 1].speechSamples;
+    starts[index] = Math.max(starts[index], previousEnd);
+  }
+
+  const lastIndex = blocks.length - 1;
+  if (starts[lastIndex] + blocks[lastIndex].speechSamples > totalSamples) {
+    starts[lastIndex] = totalSamples - blocks[lastIndex].speechSamples;
+    for (let index = lastIndex - 1; index >= 0; index--) {
+      starts[index] = Math.min(
+        starts[index],
+        starts[index + 1] - blocks[index].speechSamples
+      );
+    }
+  }
+
+  if (starts[0] < 0) {
+    throw new Error('La locución completa no cabe en la duración del vídeo.');
+  }
+
+  return starts.map((startSample, index) => ({
+    startSample,
+    endSample: startSample + blocks[index].speechSamples,
+  }));
+}
+
 export function calculateNaturalGapSamples(
   speechSamples: number,
   segmentCount: number,
@@ -771,28 +824,33 @@ export async function combineNaturalScriptAudioSegments(
     const masterPcm = new Uint8Array(totalSamples * 2);
     const timings: NaturalMasterTiming[] = [];
 
-    preparedSegments.forEach(({ line, pcm }, index) => {
+    const blockWindows = preparedSegments.map(({ line, pcm }, index) => {
       const startSample = Math.round(line.startSec * sampleRate);
       const endSample = index === preparedSegments.length - 1
         ? totalSamples
         : Math.round(line.endSec * sampleRate);
-      const targetSamples = endSample - startSample;
-      let padding;
-      try {
-        padding = calculateCenteredBlockPaddingSamples(pcm.byteLength / 2, targetSamples);
-      } catch {
-        const overflowSeconds = (pcm.byteLength / 2 - targetSamples) / sampleRate;
+      const speechSamples = pcm.byteLength / 2;
+      const overflowSamples = speechSamples - (endSample - startSample);
+      const maximumBorrowSamples = Math.round(sampleRate * 0.35);
+      if (overflowSamples > maximumBorrowSamples) {
         throw new Error(
-          `${line.id.toUpperCase()} supera su intervalo en ${overflowSeconds.toFixed(2)} s. `
+          `${line.id.toUpperCase()} supera su intervalo en ${(overflowSamples / sampleRate).toFixed(2)} s. `
           + 'Amplía ese bloque o divide el texto; la voz no se ha acelerado.'
         );
       }
-      masterPcm.set(pcm, (startSample + padding.beforeSamples) * 2);
+      return { startSample, endSample, speechSamples };
+    });
+    const placements = calculateNaturalBlockPlacements(blockWindows, totalSamples);
+
+    preparedSegments.forEach(({ line, pcm }, index) => {
+      const { startSample, endSample } = blockWindows[index];
+      const placement = placements[index];
+      masterPcm.set(pcm, placement.startSample * 2);
       timings.push({
         id: line.id,
         startSec: startSample / sampleRate,
         endSec: endSample / sampleRate,
-        durationSec: targetSamples / sampleRate,
+        durationSec: (endSample - startSample) / sampleRate,
       });
     });
 
