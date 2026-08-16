@@ -1,4 +1,5 @@
 import { ParsedScript, ScriptChapter, ScriptLine } from '../types';
+import { applyPeakCeilingPcm16, PRODUCTION_SAMPLE_RATE, resamplePcm16 } from './audio';
 
 /**
  * Converts timestamp string (e.g., "01:26" or "00:03" or "02:50") to seconds integer.
@@ -562,14 +563,185 @@ export function parseVideoScript(scriptText: string): ParsedScript {
   };
 }
 
+export interface NaturalMasterTiming {
+  id: string;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
+
+function createPcm16WavBlob(pcmBytes: Uint8Array, sampleRate: number): Blob {
+  const wavHeader = new ArrayBuffer(44);
+  const view = new DataView(wavHeader);
+  view.setUint32(0, 0x52494646, false);
+  view.setUint32(4, 36 + pcmBytes.byteLength, true);
+  view.setUint32(8, 0x57415645, false);
+  view.setUint32(12, 0x666d7420, false);
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  view.setUint32(36, 0x64617461, false);
+  view.setUint32(40, pcmBytes.byteLength, true);
+  return new Blob([new Uint8Array(wavHeader), pcmBytes], { type: 'audio/wav' });
+}
+
+function prepareNaturalNarrationSegment(
+  pcmBytes: Uint8Array,
+  sampleRate: number,
+  targetActiveRmsDbfs = -18.5
+): Uint8Array {
+  const sampleCount = Math.floor(pcmBytes.byteLength / 2);
+  if (sampleCount === 0) return new Uint8Array();
+  const input = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
+  const frameSamples = Math.max(1, Math.round(sampleRate * 0.01));
+  const frameCount = Math.floor(sampleCount / frameSamples);
+  const threshold = 32768 * 10 ** (-50 / 20);
+  const activeFrames = new Uint8Array(frameCount);
+  let firstActiveFrame = -1;
+  let lastActiveFrame = -1;
+
+  for (let frame = 0; frame < frameCount; frame++) {
+    let energy = 0;
+    const start = frame * frameSamples;
+    for (let index = 0; index < frameSamples; index++) {
+      const sample = input.getInt16((start + index) * 2, true);
+      energy += sample * sample;
+    }
+    if (Math.sqrt(energy / frameSamples) > threshold) {
+      activeFrames[frame] = 1;
+      if (firstActiveFrame < 0) firstActiveFrame = frame;
+      lastActiveFrame = frame;
+    }
+  }
+
+  if (firstActiveFrame < 0) return pcmBytes.slice();
+  const paddingSamples = Math.round(sampleRate * 0.1);
+  const firstSample = Math.max(0, firstActiveFrame * frameSamples - paddingSamples);
+  const lastSample = Math.min(
+    sampleCount,
+    (lastActiveFrame + 1) * frameSamples + paddingSamples
+  );
+  const trimmedSamples = lastSample - firstSample;
+  const output = new Uint8Array(trimmedSamples * 2);
+  const outputView = new DataView(output.buffer);
+
+  let activeEnergy = 0;
+  let activeSampleCount = 0;
+  let peak = 0;
+  for (let index = firstSample; index < lastSample; index++) {
+    const sample = input.getInt16(index * 2, true);
+    const frame = Math.floor(index / frameSamples);
+    if (activeFrames[frame]) {
+      activeEnergy += sample * sample;
+      activeSampleCount += 1;
+    }
+    peak = Math.max(peak, Math.abs(sample));
+  }
+
+  const activeRms = Math.sqrt(activeEnergy / Math.max(1, activeSampleCount));
+  const desiredRms = 32768 * 10 ** (targetActiveRmsDbfs / 20);
+  const requestedGain = activeRms > 0 ? desiredRms / activeRms : 1;
+  const limitedGain = Math.max(10 ** (-4 / 20), Math.min(10 ** (4 / 20), requestedGain));
+  const peakCeiling = 32767 * 10 ** (-1.5 / 20);
+  const gain = peak > 0 ? Math.min(limitedGain, peakCeiling / peak) : 1;
+  const fadeSamples = Math.min(Math.round(sampleRate * 0.008), Math.floor(trimmedSamples / 2));
+
+  for (let index = 0; index < trimmedSamples; index++) {
+    let envelope = 1;
+    if (index < fadeSamples) envelope = index / Math.max(1, fadeSamples);
+    if (index >= trimmedSamples - fadeSamples) {
+      envelope = Math.min(envelope, (trimmedSamples - index - 1) / Math.max(1, fadeSamples));
+    }
+    const sample = Math.round(input.getInt16((firstSample + index) * 2, true) * gain * envelope);
+    outputView.setInt16(index * 2, Math.max(-32768, Math.min(32767, sample)), true);
+  }
+  return output;
+}
+
 /**
- * Stitch multiple PCM audio Blobs/WAVs into a single continuous master WAV video audio file (24kHz Mono 16-bit PCM).
+ * Joins independently generated natural phrases sequentially. It removes only
+ * excessive edge silence, applies a very small loudness correction and creates
+ * consistent pauses without changing the duration or pitch of the speech.
+ */
+export async function combineNaturalScriptAudioSegments(
+  lines: ScriptLine[],
+  pauseSeconds = 0.25
+): Promise<{
+  masterBlob: Blob;
+  masterBlobUrl: string;
+  durationSeconds: number;
+  timings: NaturalMasterTiming[];
+}> {
+  const sampleRate = PRODUCTION_SAMPLE_RATE;
+  const leadingSilenceSamples = Math.round(sampleRate * 0.2);
+  const trailingSilenceSamples = Math.round(sampleRate * 0.4);
+  const pauseSamples = Math.round(sampleRate * pauseSeconds);
+  const preparedSegments: Array<{ line: ScriptLine; pcm: Uint8Array }> = [];
+
+  for (const line of lines) {
+    if (!line.audioUrl) continue;
+    const response = await fetch(line.audioUrl);
+    const wav = await response.arrayBuffer();
+    if (wav.byteLength <= 44) continue;
+    const sourceSampleRate = new DataView(wav).getUint32(24, true);
+    const sourcePcm = new Uint8Array(wav, 44);
+    const productionPcm = sourceSampleRate === sampleRate
+      ? sourcePcm
+      : resamplePcm16(sourcePcm, sourceSampleRate, sampleRate);
+    preparedSegments.push({ line, pcm: prepareNaturalNarrationSegment(productionPcm, sampleRate) });
+  }
+
+  if (preparedSegments.length === 0) {
+    throw new Error('No hay frases naturales válidas para crear el máster.');
+  }
+
+  const totalSamples = leadingSilenceSamples
+    + trailingSilenceSamples
+    + preparedSegments.reduce((total, segment) => total + segment.pcm.byteLength / 2, 0)
+    + pauseSamples * Math.max(0, preparedSegments.length - 1);
+  const masterPcm = new Uint8Array(totalSamples * 2);
+  const timings: NaturalMasterTiming[] = [];
+  let cursor = leadingSilenceSamples;
+  let planStartSample = 0;
+
+  preparedSegments.forEach((segment, index) => {
+    masterPcm.set(segment.pcm, cursor * 2);
+    cursor += segment.pcm.byteLength / 2;
+    const isLast = index === preparedSegments.length - 1;
+    const planEndSample = isLast ? totalSamples : cursor + Math.floor(pauseSamples / 2);
+    timings.push({
+      id: segment.line.id,
+      startSec: planStartSample / sampleRate,
+      endSec: planEndSample / sampleRate,
+      durationSec: (planEndSample - planStartSample) / sampleRate,
+    });
+    planStartSample = planEndSample;
+    if (!isLast) cursor += pauseSamples;
+  });
+
+  const safeMasterPcm = applyPeakCeilingPcm16(masterPcm, -1.5);
+  const masterBlob = createPcm16WavBlob(safeMasterPcm, sampleRate);
+  return {
+    masterBlob,
+    masterBlobUrl: URL.createObjectURL(masterBlob),
+    durationSeconds: totalSamples / sampleRate,
+    timings,
+  };
+}
+
+/**
+ * Stitch multiple PCM audio Blobs/WAVs into a single continuous master WAV
+ * video audio file (48 kHz mono 16-bit PCM).
  */
 export async function combineScriptAudioSegments(
   lines: ScriptLine[],
   totalDurationSec: number
 ): Promise<{ masterBlob: Blob; masterBlobUrl: string; totalBytes: number }> {
-  const sampleRate = 24000;
+  const sampleRate = PRODUCTION_SAMPLE_RATE;
   const numChannels = 1;
   const bitsPerSample = 16;
   const totalSamples = Math.ceil(totalDurationSec * sampleRate);
@@ -584,9 +756,19 @@ export async function combineScriptAudioSegments(
       const arrayBuf = await resp.arrayBuffer();
       if (arrayBuf.byteLength <= 44) continue;
 
-      // Extract raw 16-bit PCM (skip 44-byte WAV header)
-      const linePcmView = new DataView(arrayBuf, 44);
-      const lineSamples = Math.floor((arrayBuf.byteLength - 44) / 2);
+      // App-generated WAVs use a canonical 44-byte PCM header. Keep a fallback
+      // conversion so older 24 kHz projects can still be compiled correctly.
+      const sourceSampleRate = new DataView(arrayBuf).getUint32(24, true);
+      const sourcePcmBytes = new Uint8Array(arrayBuf, 44);
+      const productionPcmBytes = sourceSampleRate === sampleRate
+        ? sourcePcmBytes
+        : resamplePcm16(sourcePcmBytes, sourceSampleRate, sampleRate);
+      const linePcmView = new DataView(
+        productionPcmBytes.buffer,
+        productionPcmBytes.byteOffset,
+        productionPcmBytes.byteLength
+      );
+      const lineSamples = Math.floor(productionPcmBytes.byteLength / 2);
 
       const startSampleIndex = Math.floor(line.startSec * sampleRate);
 
