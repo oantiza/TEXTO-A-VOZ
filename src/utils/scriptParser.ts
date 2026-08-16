@@ -86,6 +86,7 @@ interface FrameTimedBlock {
 /**
  * Parses NUVIA production Markdown with blocks such as:
  * ## P01 · `00:00:00:00–00:00:07:00` · 7 segundos
+ * ### P01 · 00:00:00:00–00:00:07:00 · F0000–F0209
  *
  * Non-spoken appendices (educational notice, pronunciation notes, etc.) are
  * deliberately excluded. Pronunciation mappings are kept separately through
@@ -95,7 +96,7 @@ function parseFrameTimedMarkdown(scriptText: string): ParsedScript | null {
   const normalized = scriptText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const fpsMatch = normalized.match(/\*\*Frecuencia:\*\*\s*(\d+(?:[.,]\d+)?)\s*fps/i);
   const frameRate = fpsMatch ? Number(fpsMatch[1].replace(',', '.')) : 30;
-  const blockHeaderPattern = /^##\s+(.+?)\s*·\s*`?(\d{2}:\d{2}:\d{2}:\d{2})\s*[–—-]\s*(\d{2}:\d{2}:\d{2}:\d{2})`?(?:\s*·.*)?$/;
+  const blockHeaderPattern = /^#{2,3}\s+(.+?)\s*·\s*`?(\d{2}:\d{2}:\d{2}:\d{2})\s*[–—-]\s*(\d{2}:\d{2}:\d{2}:\d{2})`?(?:\s*·.*)?$/;
   const lines = normalized.split('\n');
   const blocks: FrameTimedBlock[] = [];
 
@@ -570,6 +571,67 @@ export interface NaturalMasterTiming {
   durationSec: number;
 }
 
+export interface NaturalMasterOptions {
+  /** Minimum silence between narration blocks. */
+  pauseSeconds?: number;
+  /**
+   * Optional final duration. Extra time is distributed as silence between
+   * blocks; the spoken audio is never stretched or slowed down.
+   */
+  targetDurationSeconds?: number;
+  /** Place every natural phrase inside its own source interval using silence. */
+  fitBlocksToTargets?: boolean;
+}
+
+export function calculateCenteredBlockPaddingSamples(
+  speechSamples: number,
+  targetSamples: number
+): { beforeSamples: number; afterSamples: number } {
+  if (speechSamples > targetSamples) {
+    throw new Error('La voz natural no cabe en el intervalo asignado.');
+  }
+  const availableSamples = targetSamples - speechSamples;
+  const beforeSamples = Math.floor(availableSamples / 2);
+  return {
+    beforeSamples,
+    afterSamples: availableSamples - beforeSamples,
+  };
+}
+
+export function calculateNaturalGapSamples(
+  speechSamples: number,
+  segmentCount: number,
+  sampleRate: number,
+  options: NaturalMasterOptions = {}
+): number[] {
+  const gapCount = Math.max(0, segmentCount - 1);
+  if (gapCount === 0) return [];
+
+  const leadingSilenceSamples = Math.round(sampleRate * 0.2);
+  const trailingSilenceSamples = Math.round(sampleRate * 0.4);
+  const minimumGapSamples = Math.round(sampleRate * (options.pauseSeconds ?? 0.25));
+  const minimumTotalSamples = leadingSilenceSamples
+    + trailingSilenceSamples
+    + speechSamples
+    + minimumGapSamples * gapCount;
+  const requestedTotalSamples = options.targetDurationSeconds
+    ? Math.round(options.targetDurationSeconds * sampleRate)
+    : minimumTotalSamples;
+  const finalTotalSamples = Math.max(minimumTotalSamples, requestedTotalSamples);
+  const totalGapSamples = finalTotalSamples
+    - leadingSilenceSamples
+    - trailingSilenceSamples
+    - speechSamples;
+  const baseGapSamples = Math.floor(totalGapSamples / gapCount);
+  let remainder = totalGapSamples - baseGapSamples * gapCount;
+
+  return Array.from({ length: gapCount }, () => {
+    const gapSamples = baseGapSamples + (remainder > 0 ? 1 : 0);
+    remainder = Math.max(0, remainder - 1);
+    return gapSamples;
+  });
+}
+
 function createPcm16WavBlob(pcmBytes: Uint8Array, sampleRate: number): Blob {
   const wavHeader = new ArrayBuffer(44);
   const view = new DataView(wavHeader);
@@ -669,7 +731,7 @@ function prepareNaturalNarrationSegment(
  */
 export async function combineNaturalScriptAudioSegments(
   lines: ScriptLine[],
-  pauseSeconds = 0.25
+  options: NaturalMasterOptions = {}
 ): Promise<{
   masterBlob: Blob;
   masterBlobUrl: string;
@@ -679,7 +741,6 @@ export async function combineNaturalScriptAudioSegments(
   const sampleRate = PRODUCTION_SAMPLE_RATE;
   const leadingSilenceSamples = Math.round(sampleRate * 0.2);
   const trailingSilenceSamples = Math.round(sampleRate * 0.4);
-  const pauseSamples = Math.round(sampleRate * pauseSeconds);
   const preparedSegments: Array<{ line: ScriptLine; pcm: Uint8Array }> = [];
 
   for (const line of lines) {
@@ -699,10 +760,63 @@ export async function combineNaturalScriptAudioSegments(
     throw new Error('No hay frases naturales válidas para crear el máster.');
   }
 
+  if (options.fitBlocksToTargets) {
+    const totalSamples = Math.round(
+      Math.max(...preparedSegments.map(({ line }) => line.endSec)) * sampleRate
+    );
+    const masterPcm = new Uint8Array(totalSamples * 2);
+    const timings: NaturalMasterTiming[] = [];
+
+    preparedSegments.forEach(({ line, pcm }, index) => {
+      const startSample = Math.round(line.startSec * sampleRate);
+      const endSample = index === preparedSegments.length - 1
+        ? totalSamples
+        : Math.round(line.endSec * sampleRate);
+      const targetSamples = endSample - startSample;
+      let padding;
+      try {
+        padding = calculateCenteredBlockPaddingSamples(pcm.byteLength / 2, targetSamples);
+      } catch {
+        const overflowSeconds = (pcm.byteLength / 2 - targetSamples) / sampleRate;
+        throw new Error(
+          `${line.id.toUpperCase()} supera su intervalo en ${overflowSeconds.toFixed(2)} s. `
+          + 'Amplía ese bloque o divide el texto; la voz no se ha acelerado.'
+        );
+      }
+      masterPcm.set(pcm, (startSample + padding.beforeSamples) * 2);
+      timings.push({
+        id: line.id,
+        startSec: startSample / sampleRate,
+        endSec: endSample / sampleRate,
+        durationSec: targetSamples / sampleRate,
+      });
+    });
+
+    const safeMasterPcm = applyPeakCeilingPcm16(masterPcm, -1.5);
+    const masterBlob = createPcm16WavBlob(safeMasterPcm, sampleRate);
+    return {
+      masterBlob,
+      masterBlobUrl: URL.createObjectURL(masterBlob),
+      durationSeconds: totalSamples / sampleRate,
+      timings,
+    };
+  }
+
+  const speechSamples = preparedSegments.reduce(
+    (total, segment) => total + segment.pcm.byteLength / 2,
+    0
+  );
+  const gapSamples = calculateNaturalGapSamples(
+    speechSamples,
+    preparedSegments.length,
+    sampleRate,
+    options
+  );
+
   const totalSamples = leadingSilenceSamples
     + trailingSilenceSamples
-    + preparedSegments.reduce((total, segment) => total + segment.pcm.byteLength / 2, 0)
-    + pauseSamples * Math.max(0, preparedSegments.length - 1);
+    + speechSamples
+    + gapSamples.reduce((total, samples) => total + samples, 0);
   const masterPcm = new Uint8Array(totalSamples * 2);
   const timings: NaturalMasterTiming[] = [];
   let cursor = leadingSilenceSamples;
@@ -712,7 +826,8 @@ export async function combineNaturalScriptAudioSegments(
     masterPcm.set(segment.pcm, cursor * 2);
     cursor += segment.pcm.byteLength / 2;
     const isLast = index === preparedSegments.length - 1;
-    const planEndSample = isLast ? totalSamples : cursor + Math.floor(pauseSamples / 2);
+    const followingGapSamples = isLast ? 0 : gapSamples[index];
+    const planEndSample = isLast ? totalSamples : cursor + Math.floor(followingGapSamples / 2);
     timings.push({
       id: segment.line.id,
       startSec: planStartSample / sampleRate,
@@ -720,7 +835,7 @@ export async function combineNaturalScriptAudioSegments(
       durationSec: (planEndSample - planStartSample) / sampleRate,
     });
     planStartSample = planEndSample;
-    if (!isLast) cursor += pauseSamples;
+    if (!isLast) cursor += followingGapSamples;
   });
 
   const safeMasterPcm = applyPeakCeilingPcm16(masterPcm, -1.5);
