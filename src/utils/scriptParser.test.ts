@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_NUVIA_SCRIPT,
+  calculateNaturalGapSamples,
+  calculateCenteredBlockPaddingSamples,
   frameTimecodeToSeconds,
   parseVideoScript,
   scriptToSrt,
@@ -104,5 +106,65 @@ Este texto aparece en pantalla y no se lee en voz alta.
     expect(frameTimecodeToSeconds('00:01:02:15', 30)).toBe(62.5);
     expect(frameTimecodeToSeconds('00:00:01:12', 24)).toBe(1.5);
     expect(frameTimecodeToSeconds('00:00:01:30', 30)).toBe(0);
+  });
+
+  it('accepts the three-level block headings used by current NUVIA scripts', () => {
+    const parsed = parseVideoScript(`# Locución NUVIA
+
+**Frecuencia:** 30 fps
+
+### P01 · 00:00:00:00–00:00:05:00 · F0000–F0149
+
+Primera idea.
+
+### P02 · 00:00:05:00–00:00:11:00 · F0150–F0329
+
+Segunda idea.
+
+## Aviso educativo escrito
+
+Esto no se lee.`);
+    const lines = parsed.chapters.flatMap((chapter) => chapter.lines);
+
+    expect(parsed.sourceFormat).toBe('frame-timed-markdown');
+    expect(parsed.totalDurationSec).toBe(11);
+    expect(lines).toHaveLength(2);
+    expect(lines.map((line) => line.text)).toEqual(['Primera idea.', 'Segunda idea.']);
+  });
+});
+
+describe('calculateNaturalGapSamples', () => {
+  it('keeps the standard pause when no final duration is requested', () => {
+    expect(calculateNaturalGapSamples(800, 3, 100)).toEqual([25, 25]);
+  });
+
+  it('fills a longer target only with evenly distributed pauses', () => {
+    const gaps = calculateNaturalGapSamples(800, 3, 100, {
+      targetDurationSeconds: 11,
+    });
+
+    expect(gaps).toEqual([120, 120]);
+    expect(20 + 40 + 800 + gaps.reduce((total, gap) => total + gap, 0)).toBe(1100);
+  });
+
+  it('never shortens pauses or speech to reach a target that is too small', () => {
+    expect(calculateNaturalGapSamples(800, 3, 100, {
+      targetDurationSeconds: 8,
+    })).toEqual([25, 25]);
+  });
+});
+
+describe('calculateCenteredBlockPaddingSamples', () => {
+  it('centres natural speech inside the visual interval', () => {
+    expect(calculateCenteredBlockPaddingSamples(800, 1000)).toEqual({
+      beforeSamples: 100,
+      afterSamples: 100,
+    });
+  });
+
+  it('rejects a phrase that would require speeding up the voice', () => {
+    expect(() => calculateCenteredBlockPaddingSamples(1001, 1000)).toThrow(
+      'La voz natural no cabe en el intervalo asignado.'
+    );
   });
 });

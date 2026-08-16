@@ -80,6 +80,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   const [masterDurationSec, setMasterDurationSec] = useState<number | null>(null);
   const [masterIsPreciselySynced, setMasterIsPreciselySynced] = useState<boolean>(false);
   const [masterTimingCsv, setMasterTimingCsv] = useState<string | null>(null);
+  const [fitNaturalPausesToScript, setFitNaturalPausesToScript] = useState<boolean>(true);
   const [isConvertingMasterMp3, setIsConvertingMasterMp3] = useState<boolean>(false);
   const [isPlayingMaster, setIsPlayingMaster] = useState<boolean>(false);
   const [currentTimeSec, setCurrentTimeSec] = useState<number>(0);
@@ -597,11 +598,14 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     setGlobalError(null);
     try {
       const { masterBlob, masterBlobUrl, durationSeconds, timings } =
-        await combineNaturalScriptAudioSegments(linesWithAudio);
+        await combineNaturalScriptAudioSegments(linesWithAudio, {
+          targetDurationSeconds: fitNaturalPausesToScript ? parsedScript.totalDurationSec : undefined,
+          fitBlocksToTargets: fitNaturalPausesToScript,
+        });
       setMasterAudioUrl(masterBlobUrl);
       setMasterAudioBlob(masterBlob);
       setMasterDurationSec(durationSeconds);
-      setMasterIsPreciselySynced(false);
+      setMasterIsPreciselySynced(fitNaturalPausesToScript);
 
       const frameRate = parsedScript.frameRate || 30;
       const csvRows = ['plan,start_tc,end_tc,start_frame,end_frame,duration_frames,duration_seconds'];
@@ -982,16 +986,28 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           </h3>
           <p className="text-xs text-slate-500">
             {isFrameTimedScript
-              ? 'Recomendado: Kore Flash por bloques, sin estirar la voz, con pausas breves y nivel homogéneo.'
+              ? 'Recomendado: Kore Flash por bloques, sin estirar la voz y repartiendo el tiempo libre en pausas naturales.'
               : 'Sintetiza todo el documento en 1 solo paso para ahorrar peticiones, o genera frase por frase para sincronización milimétrica.'}
           </p>
         </div>
 
         <div className="flex flex-col sm:flex-row sm:flex-wrap items-center gap-2.5 w-full md:w-auto md:justify-end">
+          {isFrameTimedScript && (
+            <label className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl border border-amber-200 bg-amber-50 text-xs font-semibold text-amber-900">
+              <input
+                type="checkbox"
+                checked={fitNaturalPausesToScript}
+                onChange={(event) => setFitNaturalPausesToScript(event.target.checked)}
+                disabled={isGeneratingAll || isCompilingMaster}
+                className="accent-amber-600"
+              />
+              Encajar cada bloque con pausas
+            </label>
+          )}
           <button
             onClick={handleGenerateNaturalScriptLines}
             disabled={isGeneratingAll || isCompilingMaster || allLines.length === 0}
-            title="Genera cada bloque con Gemini Flash a velocidad natural y crea una sola pista continua, audible y sin estirado."
+            title="Genera cada bloque con Gemini Flash a velocidad natural. Si la opción está activa, completa la duración del guion repartiendo pausas entre ideas."
             className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
           >
             {generationMode === 'natural-blocks' ? (
