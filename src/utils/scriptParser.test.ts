@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_NUVIA_SCRIPT,
   calculateNaturalGapSamples,
+  calculateNaturalBlockPlacements,
   calculateCenteredBlockPaddingSamples,
   frameTimecodeToSeconds,
   parseVideoScript,
@@ -166,5 +167,38 @@ describe('calculateCenteredBlockPaddingSamples', () => {
     expect(() => calculateCenteredBlockPaddingSamples(1001, 1000)).toThrow(
       'La voz natural no cabe en el intervalo asignado.'
     );
+  });
+});
+
+describe('calculateNaturalBlockPlacements', () => {
+  it('borrows silence from neighbouring blocks without overlapping speech', () => {
+    expect(calculateNaturalBlockPlacements([
+      { startSample: 0, endSample: 100, speechSamples: 80 },
+      { startSample: 100, endSample: 200, speechSamples: 120 },
+      { startSample: 200, endSample: 300, speechSamples: 80 },
+    ], 300)).toEqual([
+      { startSample: 10, endSample: 90 },
+      { startSample: 90, endSample: 210 },
+      { startSample: 210, endSample: 290 },
+    ]);
+  });
+
+  it('moves earlier phrases back when the last phrase needs trailing room', () => {
+    expect(calculateNaturalBlockPlacements([
+      { startSample: 0, endSample: 100, speechSamples: 80 },
+      { startSample: 100, endSample: 200, speechSamples: 80 },
+      { startSample: 200, endSample: 300, speechSamples: 120 },
+    ], 300)).toEqual([
+      { startSample: 10, endSample: 90 },
+      { startSample: 100, endSample: 180 },
+      { startSample: 180, endSample: 300 },
+    ]);
+  });
+
+  it('rejects a set of phrases that cannot fit without overlap', () => {
+    expect(() => calculateNaturalBlockPlacements([
+      { startSample: 0, endSample: 100, speechSamples: 160 },
+      { startSample: 100, endSample: 200, speechSamples: 160 },
+    ], 200)).toThrow('La locución completa no cabe');
   });
 });
