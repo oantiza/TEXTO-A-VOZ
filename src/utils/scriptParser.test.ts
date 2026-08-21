@@ -5,10 +5,28 @@ import {
   calculateNaturalBlockPlacements,
   calculateCenteredBlockPaddingSamples,
   frameTimecodeToSeconds,
+  getMissingAudioBlockIds,
   parseVideoScript,
   scriptToSrt,
   scriptToVtt,
 } from './scriptParser';
+
+describe('getMissingAudioBlockIds', () => {
+  it('lists only blocks that have no generated audio', () => {
+    expect(getMissingAudioBlockIds([
+      { id: 'p01', audioUrl: 'blob:audio-1' },
+      { id: 'p02', audioUrl: undefined },
+      { id: 'p03', audioUrl: '' },
+    ])).toEqual(['P02', 'P03']);
+  });
+
+  it('returns an empty list when the master is complete', () => {
+    expect(getMissingAudioBlockIds([
+      { id: 'p01', audioUrl: 'blob:audio-1' },
+      { id: 'p02', audioUrl: 'blob:audio-2' },
+    ])).toEqual([]);
+  });
+});
 
 describe('parseVideoScript', () => {
   it('parses SRT cues with exact timing', () => {

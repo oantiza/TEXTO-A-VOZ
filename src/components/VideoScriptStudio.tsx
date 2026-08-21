@@ -13,6 +13,7 @@ import {
   combineNaturalScriptAudioSegments,
   combineScriptAudioSegments,
   DEFAULT_NUVIA_SCRIPT,
+  getMissingAudioBlockIds,
   parseVideoScript,
   scriptToSrt,
   scriptToVtt,
@@ -478,6 +479,16 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
     setIsGeneratingAll(false);
     setGenerationMode('none');
+
+    const missingBlockIds = getMissingAudioBlockIds(linesToProcess);
+    if (missingBlockIds.length > 0) {
+      setGlobalError(
+        `No se ha creado el máster: faltan ${missingBlockIds.join(', ')}. `
+        + 'Reintenta esos bloques antes de unir el audio.'
+      );
+      return;
+    }
+
     await compileNaturalMasterAudioTrack(linesToProcess);
   };
 
@@ -582,6 +593,15 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
     setIsGeneratingAll(false);
     setGenerationMode('none');
+
+    const missingBlockIds = getMissingAudioBlockIds(linesToProcess);
+    if (missingBlockIds.length > 0) {
+      setGlobalError(
+        `No se ha creado el máster: faltan ${missingBlockIds.join(', ')}. `
+        + 'Reintenta esos bloques antes de unir el audio.'
+      );
+      return;
+    }
 
     // After generating all available lines, stitch continuous master audio track
     await compileMasterAudioTrack(linesToProcess);
