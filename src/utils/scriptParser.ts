@@ -1,6 +1,15 @@
 import { ParsedScript, ScriptChapter, ScriptLine } from '../types';
 import { applyPeakCeilingPcm16, PRODUCTION_SAMPLE_RATE, resamplePcm16 } from './audio';
 
+/** Returns the identifiers of narration blocks that still have no generated audio. */
+export function getMissingAudioBlockIds(
+  lines: Array<Pick<ScriptLine, 'id' | 'audioUrl'>>
+): string[] {
+  return lines
+    .filter((line) => !line.audioUrl)
+    .map((line) => line.id.toUpperCase());
+}
+
 /**
  * Converts timestamp string (e.g., "01:26" or "00:03" or "02:50") to seconds integer.
  */
