@@ -163,6 +163,27 @@ describe('timeStretchPcm16', () => {
     URL.revokeObjectURL(result.masterBlobUrl);
   });
 
+  it('borrows more than 350 ms of neighbouring silence for a natural block', async () => {
+    const shortBase64 = Buffer.from(createSineWave(220, 0.5)).toString('base64');
+    const longBase64 = Buffer.from(createSineWave(220, 1)).toString('base64');
+    const first = base64ToWavBlob(shortBase64, 'audio/pcm;rate=24000');
+    const second = base64ToWavBlob(longBase64, 'audio/pcm;rate=24000');
+    const third = base64ToWavBlob(shortBase64, 'audio/pcm;rate=24000');
+
+    const result = await combineNaturalScriptAudioSegments([
+      { id: 'line-1', startSec: 0, endSec: 0.75, targetDurationSec: 0.75, text: 'Uno', audioUrl: first.blobUrl },
+      { id: 'line-2', startSec: 0.75, endSec: 1.35, targetDurationSec: 0.6, text: 'Dos', audioUrl: second.blobUrl },
+      { id: 'line-3', startSec: 1.35, endSec: 2.1, targetDurationSec: 0.75, text: 'Tres', audioUrl: third.blobUrl },
+    ], { fitBlocksToTargets: true });
+
+    expect(result.durationSeconds).toBeCloseTo(2.1, 4);
+    expect(result.timings).toHaveLength(3);
+    URL.revokeObjectURL(first.blobUrl);
+    URL.revokeObjectURL(second.blobUrl);
+    URL.revokeObjectURL(third.blobUrl);
+    URL.revokeObjectURL(result.masterBlobUrl);
+  });
+
   it('still rejects real speech that is longer than its target block', async () => {
     const source = createSineWave(220, 1);
     const base64 = Buffer.from(source).toString('base64');

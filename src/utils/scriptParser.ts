@@ -840,7 +840,11 @@ export async function combineNaturalScriptAudioSegments(
         : Math.round(line.endSec * sampleRate);
       const speechSamples = pcm.byteLength / 2;
       const overflowSamples = speechSamples - (endSample - startSample);
-      const maximumBorrowSamples = Math.round(sampleRate * 0.35);
+      // A natural TTS take can vary by a few frames between generations. Let
+      // the placement planner borrow a modest amount of unused neighbouring
+      // silence before rejecting an otherwise valid master. The planner still
+      // guarantees that speech never overlaps or leaves the video timeline.
+      const maximumBorrowSamples = Math.round(sampleRate * 1.25);
       if (overflowSamples > maximumBorrowSamples) {
         throw new Error(
           `${line.id.toUpperCase()} supera su intervalo en ${(overflowSamples / sampleRate).toFixed(2)} s. `
