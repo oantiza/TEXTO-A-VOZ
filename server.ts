@@ -498,6 +498,7 @@ async function startServer() {
           retryAfterSec = Math.ceil(parseFloat(matchDelay[1])) + 2;
         }
 
+        res.setHeader('Retry-After', retryAfterSec);
         return res.status(429).json({
           error: `Límite de la API gratuita alcanzado. Reintentando automáticamente en ${retryAfterSec}s...`,
           isQuotaExhausted: true,

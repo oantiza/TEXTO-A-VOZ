@@ -435,6 +435,9 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
           if (response.status === 429 || data.isQuotaExhausted) {
             const waitTime = data.retryAfterSec || 15;
+            // A temporary quota pause is not a failed synthesis attempt. Keep
+            // retrying the current block until the API becomes available again.
+            attempts -= 1;
             for (let second = waitTime; second > 0; second--) {
               setGlobalError(`Cuota temporal de voz: reanudando en ${second} segundos…`);
               await new Promise((resolve) => setTimeout(resolve, 1_000));
@@ -538,9 +541,12 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
           if (resp.status === 429 || data.isQuotaExhausted) {
             const waitTime = data.retryAfterSec || 15;
+            // Do not exhaust the three real-error attempts while the API is
+            // explicitly asking us to wait. Retry this same phrase afterwards.
+            attempts -= 1;
             for (let sec = waitTime; sec > 0; sec--) {
               setGlobalError(
-                `Límite por minuto de la API gratuita alcanzado. Pausando automáticamente ${sec} segundos antes de continuar con la siguiente frase...`
+                `Cuota temporal de voz: reanudando esta frase en ${sec} segundos…`
               );
               await new Promise((res) => setTimeout(res, 1000));
             }
