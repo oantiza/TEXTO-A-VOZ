@@ -6,7 +6,10 @@ import dotenv from "dotenv";
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { splitTextForStableTts } from './src/utils/ttsChunking';
 
-dotenv.config();
+const dotenvValues = dotenv.config().parsed ?? {};
+// Solo la clave del fichero .env manda sobre una GEMINI_API_KEY heredada del entorno de
+// Windows; el resto de variables conservan la precedencia normal (PORT en Cloud Run, etc.).
+if (dotenvValues.GEMINI_API_KEY) process.env.GEMINI_API_KEY = dotenvValues.GEMINI_API_KEY;
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_TEXT_LENGTH = 24_000;
@@ -157,9 +160,17 @@ function buildPromptText(
 }
 
 // Helper for calling Gemini with exponential backoff retries for 503 / high demand / 429 rate limit errors
-async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRetries = 3) {
+// Una respuesta sin audio es el fallo más habitual con estos modelos y casi
+// siempre se resuelve repitiendo, así que tiene su propio presupuesto de intentos.
+async function generateTTSWithRetry(
+  aiClient: GoogleGenAI,
+  genConfig: any,
+  maxRetries = 3,
+  maxMissingAudioRetries = 6
+) {
   let lastError: any = null;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  const attemptLimit = Math.max(maxRetries, maxMissingAudioRetries);
+  for (let attempt = 1; attempt <= attemptLimit; attempt++) {
     try {
       const response = await aiClient.models.generateContent(genConfig);
       if (!extractAudioPart(response)) {
@@ -188,8 +199,9 @@ async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRe
         errStr.includes("high demand") ||
         errStr.includes("overloaded");
 
-      if (isTransient && attempt < maxRetries) {
-        let delayMs = attempt * 2000;
+      const limitForThisError = err?.isMissingAudio === true ? maxMissingAudioRetries : maxRetries;
+      if (isTransient && attempt < limitForThisError) {
+        let delayMs = err?.isMissingAudio === true ? 1_200 : attempt * 2000;
         if (isQuota) {
           const matchDelay = errStr.match(/retry in ([\d\.]+)s/i);
           if (matchDelay && matchDelay[1]) {
@@ -199,7 +211,7 @@ async function generateTTSWithRetry(aiClient: GoogleGenAI, genConfig: any, maxRe
           }
         }
         const reason = isQuota ? 'Cuota 429' : err?.isMissingAudio ? 'Respuesta sin audio' : '503 Servidor';
-        console.warn(`[Gemini TTS Retry] Intento ${attempt}/${maxRetries} (${reason}). Esperando ${delayMs / 1000}s...`);
+        console.warn(`[Gemini TTS Retry] Intento ${attempt}/${limitForThisError} (${reason}). Esperando ${delayMs / 1000}s...`);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       } else {
         throw err;
@@ -493,6 +505,11 @@ async function startServer() {
 
       if (is429) {
         let retryAfterSec = 12;
+        const upstreamMessage = errStr.match(/"message"\s*:\s*"([^"]+)"/)?.[1]?.trim();
+        const isFatalQuota = /spend(?:ing)?\s*cap|billing|exceeded its monthly|PerDay|per day|daily limit/i.test(errStr);
+        const quotaBlockMessage = isFatalQuota
+          ? upstreamMessage || 'La cuota del proyecto está agotada y no se restablece reintentando.'
+          : '';
         const matchDelay = errStr.match(/retry in ([\d\.]+)s/i) || errStr.match(/retryDelay":"(\d+)s"/i);
         if (matchDelay && matchDelay[1]) {
           retryAfterSec = Math.ceil(parseFloat(matchDelay[1])) + 2;
@@ -500,8 +517,11 @@ async function startServer() {
 
         res.setHeader('Retry-After', retryAfterSec);
         return res.status(429).json({
-          error: `Límite de la API gratuita alcanzado. Reintentando automáticamente en ${retryAfterSec}s...`,
+          error: quotaBlockMessage
+            ? `La API de voz ha rechazado la petición: ${quotaBlockMessage}`
+            : `Límite de la API gratuita alcanzado. Reintentando automáticamente en ${retryAfterSec}s...`,
           isQuotaExhausted: true,
+          isQuotaFatal: Boolean(quotaBlockMessage),
           retryAfterSec,
         });
       }
@@ -514,8 +534,19 @@ async function startServer() {
         });
       }
 
+      if (err?.isMissingAudio === true) {
+        return res.status(502).json({
+          error:
+            'El modelo de voz no devolvió audio para este texto tras varios intentos. Suele bastar con reintentar este bloque.',
+          isMissingAudio: true,
+        });
+      }
+
+      const upstreamDetail = errStr.match(/"message"\s*:\s*"([^"]+)"/)?.[1]?.trim();
       res.status(500).json({
-        error: "No se pudo generar el audio. Reintenta en unos segundos.",
+        error: upstreamDetail
+          ? `No se pudo generar el audio: ${upstreamDetail.slice(0, 160)}`
+          : 'No se pudo generar el audio. Reintenta en unos segundos.',
       });
     }
   });

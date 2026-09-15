@@ -10,6 +10,68 @@ export function getMissingAudioBlockIds(
     .map((line) => line.id.toUpperCase());
 }
 
+
+function lineKey(line: ScriptLine): string {
+  return `${line.startSec}|${line.endSec}|${line.text}`;
+}
+
+function chapterKey(chapter: ScriptChapter): string {
+  return `${chapter.timeRange}|${chapter.title}`;
+}
+
+/**
+ * Traslada el audio ya generado al guion recién parseado. Solo se conserva el de
+ * los bloques cuyo texto e intervalo no han cambiado; el resto se devuelve en
+ * `releasedAudioUrls` para que quien llame libere esas URL de objeto.
+ */
+export function mergeGeneratedAudio(
+  previous: ParsedScript,
+  next: ParsedScript
+): { script: ParsedScript; releasedAudioUrls: string[] } {
+  const previousLines = new Map<string, ScriptLine>();
+  const previousChapters = new Map<string, ScriptChapter>();
+  const unusedAudioUrls = new Set<string>();
+
+  for (const chapter of previous.chapters) {
+    if (chapter.audioUrl) {
+      previousChapters.set(chapterKey(chapter), chapter);
+      unusedAudioUrls.add(chapter.audioUrl);
+    }
+    for (const line of chapter.lines) {
+      if (!line.audioUrl) continue;
+      previousLines.set(lineKey(line), line);
+      unusedAudioUrls.add(line.audioUrl);
+    }
+  }
+
+  if (unusedAudioUrls.size === 0) return { script: next, releasedAudioUrls: [] };
+
+  const script: ParsedScript = {
+    ...next,
+    chapters: next.chapters.map((chapter) => {
+      const previousChapter = previousChapters.get(chapterKey(chapter));
+      if (previousChapter?.audioUrl) unusedAudioUrls.delete(previousChapter.audioUrl);
+      return {
+        ...chapter,
+        audioUrl: previousChapter?.audioUrl,
+        lines: chapter.lines.map((line) => {
+          const match = previousLines.get(lineKey(line));
+          if (!match?.audioUrl) return line;
+          unusedAudioUrls.delete(match.audioUrl);
+          return {
+            ...line,
+            audioUrl: match.audioUrl,
+            actualDurationSec: match.actualDurationSec,
+            speedFactor: match.speedFactor,
+          };
+        }),
+      };
+    }),
+  };
+
+  return { script, releasedAudioUrls: [...unusedAudioUrls] };
+}
+
 /**
  * Converts timestamp string (e.g., "01:26" or "00:03" or "02:50") to seconds integer.
  */
@@ -374,12 +436,169 @@ export function parseSubtitleCues(scriptText: string): SubtitleCue[] {
   return cues;
 }
 
+
+/** Convierte "MM:SS.d" o "HH:MM:SS.d" en segundos. Devuelve NaN si no encaja. */
+export function flexibleTimeToSeconds(value: string): number {
+  const parts = value.trim().split(':');
+  if (parts.length < 2 || parts.length > 3) return NaN;
+  const numbers = parts.map((part) => Number(part.replace(',', '.')));
+  if (numbers.some((number) => !Number.isFinite(number))) return NaN;
+  return numbers.length === 3
+    ? numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+    : numbers[0] * 60 + numbers[1];
+}
+
+/**
+ * Quita los restos de Markdown que nunca deben llegar al modelo de voz: rangos
+ * de tiempo entre comillas invertidas, marcas iniciales y signos de énfasis. Un
+ * fragmento entre comillas invertidas al principio de la frase hace que el
+ * modelo devuelva una respuesta sin audio de forma reproducible.
+ */
+export function cleanSpokenText(value: string): string {
+  const cleaned = value
+    .replace(/`[^`]*`/g, ' ')
+    .replace(
+      /^\s*\[?\d{1,2}:\d{2}(?:[.:,]\d+)?\]?\s*(?:[\u2013\u2014>\u2192-]+\s*\[?\d{1,2}:\d{2}(?:[.:,]\d+)?\]?)?\s*/,
+      ''
+    )
+    .replace(/[*_~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Si la línea era solo una marca de tiempo, es preferible mandar el original
+  // que mandar una cadena vacía.
+  return cleaned || value.trim();
+}
+
+// El rango va siempre entre comillas invertidas: es lo que distingue este
+// formato de las cabeceras "00:00\u201300:14 \u00b7 APERTURA" de otros guiones.
+const TIMED_MARKDOWN_LINE =
+  /^\s*`(\d{1,2}:\d{2}(?:[.,]\d+)?)\s*(?:\u2192|->|\u2013|\u2014|-)\s*(\d{1,2}:\d{2}(?:[.,]\d+)?)`\s+(.+?)\s*$/;
+const TIMED_MARKDOWN_SCENE = /^\s*#{3}\s+(?:`?(\d{1,2}:\d{2}(?:[.,]\d+)?)`?\s*[\u00b7|-]\s*)?(.+?)\s*$/;
+const TIMED_MARKDOWN_PART = /^\s*#{2}\s+(.+?)\s*$/;
+const TIMED_MARKDOWN_PART_DURATION = /^\s*Duraci[oó]n:\s*(\d{1,2}:\d{2}(?:[.,]\d+)?)/i;
+
+/**
+ * Parsea guiones de locución en Markdown con subtítulos cronometrados:
+ *
+ *   ## PARTE 1 — Título
+ *   Duración: 06:14.0 · 66 líneas · 18 escenas
+ *   ### 00:25.0 · Fruitopia
+ *   _Descripción de la escena, que no se locuta._
+ *   `00:25.4 → 00:31.1`  Inventemos un país pequeño: Fruitopia.
+ *
+ * Los tiempos de cada parte son relativos a su propio inicio, así que las
+ * partes se encadenan usando su duración declarada. Las líneas en cursiva son
+ * indicaciones de escena y la prosa anterior a la primera parte es un prólogo:
+ * ni unas ni otra llegan a la voz.
+ */
+function parseTimedMarkdownScript(scriptText: string): ParsedScript | null {
+  const lines = scriptText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+  const chapters: ScriptChapter[] = [];
+  let title = '';
+  let currentChapter: ScriptChapter | null = null;
+  let partOffsetSec = 0;
+  let declaredPartDurationSec = 0;
+  let maxEndInPartSec = 0;
+  let lineCount = 0;
+
+  const closePart = () => {
+    partOffsetSec += declaredPartDurationSec || maxEndInPartSec;
+    declaredPartDurationSec = 0;
+    maxEndInPartSec = 0;
+  };
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed === '---') continue;
+
+    const timed = rawLine.match(TIMED_MARKDOWN_LINE);
+    if (timed) {
+      const startLocalSec = flexibleTimeToSeconds(timed[1]);
+      const endLocalSec = flexibleTimeToSeconds(timed[2]);
+      const text = cleanMarkdownSpeechText(timed[3]);
+      if (!Number.isFinite(startLocalSec) || !Number.isFinite(endLocalSec) || endLocalSec <= startLocalSec || !text) {
+        continue;
+      }
+      if (!currentChapter) {
+        currentChapter = { id: `chap_${chapters.length + 1}`, title: 'Locución', timeRange: '', lines: [] };
+        chapters.push(currentChapter);
+      }
+      maxEndInPartSec = Math.max(maxEndInPartSec, endLocalSec);
+      currentChapter.lines.push({
+        id: `line_${++lineCount}`,
+        startSec: partOffsetSec + startLocalSec,
+        endSec: partOffsetSec + endLocalSec,
+        targetDurationSec: endLocalSec - startLocalSec,
+        text,
+        sourceTimecode: `${timed[1]}\u2013${timed[2]}`,
+      });
+      continue;
+    }
+
+    if (/^_.*_$/.test(trimmed)) continue; // indicación de escena
+
+    const partDuration = trimmed.match(TIMED_MARKDOWN_PART_DURATION);
+    if (partDuration) {
+      const duration = flexibleTimeToSeconds(partDuration[1]);
+      if (Number.isFinite(duration)) declaredPartDurationSec = duration;
+      continue;
+    }
+
+    const scene = rawLine.match(TIMED_MARKDOWN_SCENE);
+    if (scene) {
+      currentChapter = {
+        id: `chap_${chapters.length + 1}`,
+        title: cleanMarkdownSpeechText(scene[2]) || 'Escena',
+        timeRange: '',
+        lines: [],
+      };
+      chapters.push(currentChapter);
+      continue;
+    }
+
+    const part = trimmed.match(TIMED_MARKDOWN_PART);
+    if (part) {
+      if (chapters.some((chapter) => chapter.lines.length > 0)) closePart();
+      currentChapter = null;
+      continue;
+    }
+
+    if (/^#\s+/.test(trimmed) && !title) {
+      title = cleanMarkdownSpeechText(trimmed.replace(/^#\s+/, ''));
+      continue;
+    }
+  }
+
+  const usedChapters = chapters.filter((chapter) => chapter.lines.length > 0);
+  // Un solo acierto suelto no basta para dar el formato por bueno.
+  if (usedChapters.length === 0 || lineCount < 2) return null;
+
+  closePart();
+  usedChapters.forEach((chapter) => {
+    const first = chapter.lines[0];
+    const last = chapter.lines[chapter.lines.length - 1];
+    chapter.timeRange = `${secondsToTimeString(first.startSec)} \u2013 ${secondsToTimeString(last.endSec)}`;
+  });
+
+  const lastEndSec = Math.max(...usedChapters.flatMap((chapter) => chapter.lines.map((line) => line.endSec)));
+  return {
+    title: title || 'Guion de locución con tiempos',
+    voiceInfo: `${lineCount} subtítulos cronometrados`,
+    totalDurationSec: Math.max(partOffsetSec, lastEndSec),
+    chapters: usedChapters,
+    sourceFormat: 'timed-markdown',
+  };
+}
+
 /**
  * Parses script text containing timestamps like [00:00], [01:26] and chapter section headers.
  */
 export function parseVideoScript(scriptText: string): ParsedScript {
   const frameTimedMarkdown = parseFrameTimedMarkdown(scriptText);
   if (frameTimedMarkdown) return frameTimedMarkdown;
+
+  const timedMarkdown = parseTimedMarkdownScript(scriptText);
+  if (timedMarkdown) return timedMarkdown;
 
   const subtitleCues = parseSubtitleCues(scriptText);
   if (subtitleCues.length > 0) {
@@ -480,8 +699,14 @@ export function parseVideoScript(scriptText: string): ParsedScript {
       const trimmedP = p.trim();
       if (!trimmedP || trimmedP.startsWith('─') || trimmedP.startsWith('=')) continue;
 
-      // Extract title if line looks like a header (e.g., "CAPÍTULO 1", "PILAR 1", "SECCIÓN 1")
-      if (trimmedP.length < 50 && (trimmedP.toUpperCase() === trimmedP || trimmedP.includes(':') || trimmedP.includes('·'))) {
+      // Se considera título solo un rótulo corto que no termina como una frase
+      // ("CAPÍTULO 1", "PILAR 1", "Introducción:"). Antes cualquier frase corta con
+      // dos puntos se tomaba por título y desaparecía de la locución sin aviso.
+      const looksLikeHeading =
+        trimmedP.length < 50 &&
+        !/[.!?…]$/.test(trimmedP) &&
+        (trimmedP.toLocaleUpperCase() === trimmedP || trimmedP.endsWith(':') || trimmedP.includes('·'));
+      if (looksLikeHeading) {
         autoChapter = {
           id: `chap_${chapters.length + 1}`,
           title: trimmedP,

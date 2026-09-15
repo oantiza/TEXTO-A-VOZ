@@ -13,7 +13,9 @@ import {
   combineNaturalScriptAudioSegments,
   combineScriptAudioSegments,
   DEFAULT_NUVIA_SCRIPT,
+  cleanSpokenText,
   getMissingAudioBlockIds,
+  mergeGeneratedAudio,
   parseVideoScript,
   scriptToSrt,
   scriptToVtt,
@@ -66,6 +68,8 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 }) => {
   const [parsedScript, setParsedScript] = useState<ParsedScript>(() => parseVideoScript(scriptText));
   const [showScriptEditor, setShowScriptEditor] = useState<boolean>(false);
+  const parsedScriptRef = useRef<ParsedScript>(parsedScript);
+  parsedScriptRef.current = parsedScript;
 
   // Generation state
   const [isGeneratingAll, setIsGeneratingAll] = useState<boolean>(false);
@@ -121,13 +125,32 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     }
   };
 
-  // Parse raw script text when it changes
+  // Reparsea el guion conservando el audio de los bloques cuyo texto e intervalo
+  // no han cambiado; los que ya no existen se liberan.
   useEffect(() => {
     const timer = setTimeout(() => {
-      setParsedScript(parseVideoScript(scriptText));
+      const { script, releasedAudioUrls } = mergeGeneratedAudio(
+        parsedScriptRef.current,
+        parseVideoScript(scriptText)
+      );
+      releasedAudioUrls.forEach((url) => URL.revokeObjectURL(url));
+      setParsedScript(script);
     }, 500);
     return () => clearTimeout(timer);
   }, [scriptText]);
+
+  // Al cerrar el estudio se liberan los WAV por bloque y por capítulo. La pista
+  // máster no se toca: su URL pasa al historial, que es quien la libera.
+  useEffect(() => {
+    return () => {
+      parsedScriptRef.current.chapters.forEach((chapter) => {
+        if (chapter.audioUrl) URL.revokeObjectURL(chapter.audioUrl);
+        chapter.lines.forEach((line) => {
+          if (line.audioUrl) URL.revokeObjectURL(line.audioUrl);
+        });
+      });
+    };
+  }, []);
 
   // Audio timeupdate listener
   useEffect(() => {
@@ -170,8 +193,10 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
   // Count lines
   const allLines = parsedScript.chapters.flatMap((c) => c.lines);
   const generatedLinesCount = allLines.filter((l) => l.audioUrl).length;
-  const isFrameTimedScript = parsedScript.sourceFormat === 'frame-timed-markdown';
-  const speechTextFor = (line: ScriptLine) => line.spokenText || line.text;
+  const isFrameTimedScript =
+    parsedScript.sourceFormat === 'frame-timed-markdown' ||
+    parsedScript.sourceFormat === 'timed-markdown';
+  const speechTextFor = (line: ScriptLine) => cleanSpokenText(line.spokenText || line.text);
 
   const updateLineState = (lineId: string, changes: Partial<ScriptLine>) => {
     setParsedScript((prev) => ({
@@ -183,6 +208,15 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     }));
   };
 
+  const updateChapterState = (chapterId: string, changes: Partial<ScriptChapter>) => {
+    setParsedScript((prev) => ({
+      ...prev,
+      chapters: prev.chapters.map((chapter) =>
+        chapter.id === chapterId ? { ...chapter, ...changes } : chapter
+      ),
+    }));
+  };
+
   const downloadSubtitles = (format: 'srt' | 'vtt') => {
     const content = format === 'srt' ? scriptToSrt(parsedScript) : scriptToVtt(parsedScript);
     const blob = new Blob([content], { type: format === 'srt' ? 'application/x-subrip' : 'text/vtt' });
@@ -191,7 +225,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     anchor.href = url;
     anchor.download = `${parsedScript.title.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'subtitulos'}.${format}`;
     anchor.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   };
 
   // Generate entire script audio in 1 single API call (consumes only 1 request quota)
@@ -261,15 +295,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
   // Generate single chapter audio in 1 API call
   const generateChapterAudio = async (chapter: ScriptChapter) => {
-    setParsedScript((prev) => {
-      const updated = { ...prev };
-      const foundChap = updated.chapters.find((c) => c.id === chapter.id);
-      if (foundChap) {
-        foundChap.isGenerating = true;
-        foundChap.error = undefined;
-      }
-      return updated;
-    });
+    updateChapterState(chapter.id, { isGenerating: true, error: undefined });
 
     const chapterText = chapter.lines.map(speechTextFor).join(' ');
     const chapterDuration = chapter.lines.reduce((acc, l) => acc + l.targetDurationSec, 0);
@@ -299,41 +325,16 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
         chapterDuration
       );
 
-      setParsedScript((prev) => {
-        const updated = { ...prev };
-        const foundChap = updated.chapters.find((c) => c.id === chapter.id);
-        if (foundChap) {
-          foundChap.audioUrl = blobUrl;
-          foundChap.isGenerating = false;
-        }
-        return updated;
-      });
+      if (chapter.audioUrl) URL.revokeObjectURL(chapter.audioUrl);
+      updateChapterState(chapter.id, { audioUrl: blobUrl, isGenerating: false });
     } catch (err: any) {
-      setParsedScript((prev) => {
-        const updated = { ...prev };
-        const foundChap = updated.chapters.find((c) => c.id === chapter.id);
-        if (foundChap) {
-          foundChap.isGenerating = false;
-          foundChap.error = err.message || 'Error de conexión';
-        }
-        return updated;
-      });
+      updateChapterState(chapter.id, { isGenerating: false, error: err.message || 'Error de conexión' });
     }
   };
 
   // Single line generator
   const generateSingleLine = async (line: ScriptLine) => {
-    setParsedScript((prev) => {
-      const updated = { ...prev };
-      for (const chap of updated.chapters) {
-        const found = chap.lines.find((l) => l.id === line.id);
-        if (found) {
-          found.isGenerating = true;
-          found.error = undefined;
-        }
-      }
-      return updated;
-    });
+    updateLineState(line.id, { isGenerating: true, error: undefined });
 
     try {
       const resp = await fetch('/api/tts', {
@@ -362,31 +363,15 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
         line.targetDurationSec
       );
 
-      setParsedScript((prev) => {
-        const updated = { ...prev };
-        for (const chap of updated.chapters) {
-          const found = chap.lines.find((l) => l.id === line.id);
-          if (found) {
-            found.audioUrl = blobUrl;
-            found.actualDurationSec = duration;
-            found.speedFactor = speedFactor;
-            found.isGenerating = false;
-          }
-        }
-        return updated;
+      if (line.audioUrl) URL.revokeObjectURL(line.audioUrl);
+      updateLineState(line.id, {
+        audioUrl: blobUrl,
+        actualDurationSec: duration,
+        speedFactor,
+        isGenerating: false,
       });
     } catch (err: any) {
-      setParsedScript((prev) => {
-        const updated = { ...prev };
-        for (const chap of updated.chapters) {
-          const found = chap.lines.find((l) => l.id === line.id);
-          if (found) {
-            found.isGenerating = false;
-            found.error = err.message || 'Error de conexión';
-          }
-        }
-        return updated;
-      });
+      updateLineState(line.id, { isGenerating: false, error: err.message || 'Error de conexión' });
     }
   };
 
@@ -400,6 +385,28 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     setTotalLinesCount(allLines.length);
     setMasterTimingCsv(null);
 
+    // La tanda natural regenera todos los bloques: se liberan los WAV anteriores
+    // y se limpia el estado para que la interfaz no apunte a URL ya revocadas.
+    parsedScript.chapters.forEach((chapter) => {
+      chapter.lines.forEach((line) => {
+        if (line.audioUrl) URL.revokeObjectURL(line.audioUrl);
+      });
+    });
+    setParsedScript((previous) => ({
+      ...previous,
+      chapters: previous.chapters.map((chapter) => ({
+        ...chapter,
+        lines: chapter.lines.map((line) => ({
+          ...line,
+          audioUrl: undefined,
+          actualDurationSec: undefined,
+          speedFactor: 1,
+          error: undefined,
+        })),
+      })),
+    }));
+
+    let quotaWaitCount = 0;
     const linesToProcess = parsedScript.chapters.flatMap((chapter) => chapter.lines).map((line) => ({
       ...line,
       audioUrl: undefined,
@@ -435,6 +442,23 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
           if (response.status === 429 || data.isQuotaExhausted) {
             const waitTime = data.retryAfterSec || 15;
+            if (data.isQuotaFatal) {
+              updateLineState(line.id, { isGenerating: false, error: 'Cuota bloqueada' });
+              setGlobalError(data.error || 'La API de voz ha rechazado la petición de forma permanente.');
+              setIsGeneratingAll(false);
+              setGenerationMode('none');
+              return;
+            }
+            quotaWaitCount += 1;
+            if (quotaWaitCount > 40) {
+              updateLineState(line.id, { isGenerating: false, error: 'Cuota agotada' });
+              setGlobalError(
+                'La API de voz sigue devolviendo límite de cuota tras 40 esperas. Se detiene la generación para no reintentar indefinidamente.'
+              );
+              setIsGeneratingAll(false);
+              setGenerationMode('none');
+              return;
+            }
             // A temporary quota pause is not a failed synthesis attempt. Keep
             // retrying the current block until the API becomes available again.
             attempts -= 1;
@@ -505,6 +529,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
     // Keep a local snapshot updated alongside React state so the final compilation
     // never reads the stale state captured before the asynchronous generation loop.
+    let quotaWaitCount = 0;
     const linesToProcess = parsedScript.chapters.flatMap((c) => c.lines).map((line) => ({ ...line }));
 
     for (let i = 0; i < linesToProcess.length; i++) {
@@ -541,6 +566,23 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
 
           if (resp.status === 429 || data.isQuotaExhausted) {
             const waitTime = data.retryAfterSec || 15;
+            if (data.isQuotaFatal) {
+              updateLineState(line.id, { isGenerating: false, error: 'Cuota bloqueada' });
+              setGlobalError(data.error || 'La API de voz ha rechazado la petición de forma permanente.');
+              setIsGeneratingAll(false);
+              setGenerationMode('none');
+              return;
+            }
+            quotaWaitCount += 1;
+            if (quotaWaitCount > 40) {
+              updateLineState(line.id, { isGenerating: false, error: 'Cuota agotada' });
+              setGlobalError(
+                'La API de voz sigue devolviendo límite de cuota tras 40 esperas. Se detiene la generación para no reintentar indefinidamente.'
+              );
+              setIsGeneratingAll(false);
+              setGenerationMode('none');
+              return;
+            }
             // Do not exhaust the three real-error attempts while the API is
             // explicitly asking us to wait. Retry this same phrase afterwards.
             attempts -= 1;
@@ -719,6 +761,21 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
     } finally {
       setIsCompilingMaster(false);
     }
+  };
+
+  // Vuelve a montar la pista natural con los bloques que ya están en memoria,
+  // sin gastar ni una petición de API. Necesario cuando unos pocos bloques
+  // fallaron, se reintentaron a mano y el máster quedó sin crear.
+  const handleRebuildNaturalMaster = async () => {
+    const lines = parsedScript.chapters.flatMap((chapter) => chapter.lines);
+    const missingBlockIds = getMissingAudioBlockIds(lines);
+    if (missingBlockIds.length > 0) {
+      setGlobalError(
+        `Faltan ${missingBlockIds.join(', ')}. Reintenta esos bloques antes de rehacer el máster natural.`
+      );
+      return;
+    }
+    await compileNaturalMasterAudioTrack(lines);
   };
 
   // Toggle master audio play/pause
@@ -996,7 +1053,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
           <div>
             <span className="font-bold block">Formato de producción reconocido</span>
             <p className="leading-relaxed">
-              {allLines.length} bloques con código HH:MM:SS:FF a {parsedScript.frameRate} fps. Usa
+              {allLines.length} bloques cronometrados{parsedScript.frameRate ? ` a ${parsedScript.frameRate} fps` : ''}. Usa
               «Natural por bloques · Flash» para crear la locución maestra. Los códigos sirven como guía visual y la animación
               se reajusta después a los tiempos reales de la voz. El ajuste exacto queda disponible solo como alternativa.
             </p>
@@ -1089,11 +1146,34 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             )}
           </button>
 
+          {/* Rehacer el máster natural con lo ya generado */}
+          {generatedLinesCount > 0 && (
+            <button
+              onClick={handleRebuildNaturalMaster}
+              disabled={isGeneratingAll || isCompilingMaster}
+              title="Vuelve a unir los bloques ya generados respetando su velocidad natural y repartiendo las pausas. No gasta peticiones de API."
+              className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
+            >
+              {isCompilingMaster ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin text-white" />
+                  <span>Uniendo bloques…</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" />
+                  <span>🔗 Rehacer máster natural</span>
+                </>
+              )}
+            </button>
+          )}
+
           {/* Compile Master Audio Track */}
           {generatedLinesCount > 0 && (
             <button
               onClick={() => compileMasterAudioTrack()}
               disabled={isGeneratingAll || isCompilingMaster}
+              title="Coloca cada frase en su marca de tiempo exacta. Úsalo solo si generaste con «Frase por frase»: con los bloques naturales puede recortar las colas."
               className="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-md transition-all disabled:opacity-50"
             >
               {isCompilingMaster ? (
@@ -1104,7 +1184,7 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
               ) : (
                 <>
                   <Sparkles className="w-4 h-4" />
-                  <span>🔗 Unir frases generadas en un solo audio</span>
+                  <span>🔗 Unir sincronizado a marcas</span>
                 </>
               )}
             </button>
