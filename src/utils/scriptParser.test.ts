@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_NUVIA_SCRIPT,
+  cleanSpokenText,
   calculateNaturalGapSamples,
   calculateNaturalBlockPlacements,
   calculateCenteredBlockPaddingSamples,
   frameTimecodeToSeconds,
   getMissingAudioBlockIds,
+  mergeGeneratedAudio,
   parseVideoScript,
   scriptToSrt,
   scriptToVtt,
@@ -218,5 +220,153 @@ describe('calculateNaturalBlockPlacements', () => {
       { startSample: 0, endSample: 100, speechSamples: 160 },
       { startSample: 100, endSample: 200, speechSamples: 160 },
     ], 200)).toThrow('La locución completa no cabe');
+  });
+});
+
+describe('parseVideoScript en modo automático', () => {
+  it('no convierte en título una frase corta que lleva dos puntos', () => {
+    const script = parseVideoScript(
+      'Y aquí está la clave: el interés compuesto.\nPor eso conviene empezar pronto.'
+    );
+    const spoken = script.chapters.flatMap((chapter) => chapter.lines).map((line) => line.text);
+    expect(spoken).toContain('Y aquí está la clave: el interés compuesto.');
+  });
+
+  it('sigue reconociendo los rótulos de capítulo', () => {
+    const script = parseVideoScript('PILAR 1\nEl ahorro manda.\nPILAR 2\nDespués, el tiempo.');
+    expect(script.chapters.map((chapter) => chapter.title)).toEqual(
+      expect.arrayContaining(['PILAR 1', 'PILAR 2'])
+    );
+    const spoken = script.chapters.flatMap((chapter) => chapter.lines).map((line) => line.text);
+    expect(spoken).toEqual(['El ahorro manda.', 'Después, el tiempo.']);
+  });
+});
+
+describe('mergeGeneratedAudio', () => {
+  const scriptWith = (lines: Array<{ id: string; text: string; audioUrl?: string }>) => ({
+    title: 'Guion',
+    voiceInfo: '',
+    totalDurationSec: 20,
+    chapters: [
+      {
+        id: 'chap_1',
+        title: 'Capítulo',
+        timeRange: '00:00 – 00:20',
+        lines: lines.map((line, index) => ({
+          id: line.id,
+          startSec: index * 10,
+          endSec: index * 10 + 10,
+          targetDurationSec: 10,
+          text: line.text,
+          audioUrl: line.audioUrl,
+        })),
+      },
+    ],
+  });
+
+  it('conserva el audio de los bloques que no han cambiado', () => {
+    const previous = scriptWith([
+      { id: 'line_1', text: 'Uno', audioUrl: 'blob:uno' },
+      { id: 'line_2', text: 'Dos', audioUrl: 'blob:dos' },
+    ]);
+    const next = scriptWith([
+      { id: 'line_1', text: 'Uno' },
+      { id: 'line_2', text: 'Dos' },
+    ]);
+
+    const { script, releasedAudioUrls } = mergeGeneratedAudio(previous, next);
+    expect(script.chapters[0].lines.map((line) => line.audioUrl)).toEqual(['blob:uno', 'blob:dos']);
+    expect(releasedAudioUrls).toEqual([]);
+  });
+
+  it('libera solo el audio del bloque cuyo texto ha cambiado', () => {
+    const previous = scriptWith([
+      { id: 'line_1', text: 'Uno', audioUrl: 'blob:uno' },
+      { id: 'line_2', text: 'Dos', audioUrl: 'blob:dos' },
+    ]);
+    const next = scriptWith([
+      { id: 'line_1', text: 'Uno' },
+      { id: 'line_2', text: 'Dos corregido' },
+    ]);
+
+    const { script, releasedAudioUrls } = mergeGeneratedAudio(previous, next);
+    expect(script.chapters[0].lines[0].audioUrl).toBe('blob:uno');
+    expect(script.chapters[0].lines[1].audioUrl).toBeUndefined();
+    expect(releasedAudioUrls).toEqual(['blob:dos']);
+  });
+});
+
+describe('cleanSpokenText', () => {
+  it('quita el rango de tiempo entre comillas invertidas que rompe al modelo', () => {
+    expect(cleanSpokenText('`02:45.1 \u2192 02:50.7` Sumar lo que se produce.')).toBe('Sumar lo que se produce.');
+  });
+
+  it('quita el énfasis y la marca inicial, y respeta el texto limpio', () => {
+    expect(cleanSpokenText('_Produccion y gasto._')).toBe('Produccion y gasto.');
+    expect(cleanSpokenText('[03:23] Sumar lo que se gasta.')).toBe('Sumar lo que se gasta.');
+    expect(cleanSpokenText('Tu gasto es el ingreso de otro.')).toBe('Tu gasto es el ingreso de otro.');
+  });
+});
+
+describe('parseVideoScript con guion Markdown cronometrado', () => {
+  const guion = [
+    '# El PIB, explicado desde cero',
+    '',
+    'Cada linea es un subtitulo: el tiempo es cuando entra y sale de pantalla.',
+    '',
+    '---',
+    '',
+    '## PARTE 1 - Que mide el PIB',
+    '',
+    'Duracion: 00:40.0 - 3 lineas - 2 escenas',
+    '',
+    '### 00:00.0 - Portada',
+    '_El titulo aparece y una linea roja se dibuja bajo el._',
+    '',
+    '`00:00.7 -> 00:05.1`  Un pais produce millones de cosas.',
+    '',
+    '`00:05.1 -> 00:10.4`  Vamos a resumirlas en un solo numero.',
+    '',
+    '### 00:10.0 - Pregunta',
+    '_Fotos de bienes y etiquetas de servicios se acumulan._',
+    '',
+    '`00:10.4 -> 00:15.6`  Coches, pan, cortes de pelo.',
+    '',
+    '## PARTE 2 - Nominal y real',
+    '',
+    'Duracion: 00:30.0 - 1 lineas - 1 escenas',
+    '',
+    '### 00:00.0 - Portada2',
+    '_Las mismas barras, con una brecha mayor._',
+    '',
+    '`00:02.0 -> 00:08.5`  En 2023 la brecha fue mucho mayor.',
+  ].join('\n');
+
+  it('locuta solo las líneas con timecode, nunca las indicaciones de escena', () => {
+    const script = parseVideoScript(guion);
+    const textos = script.chapters.flatMap((chapter) => chapter.lines).map((line) => line.text);
+    expect(script.sourceFormat).toBe('timed-markdown');
+    expect(textos).toEqual([
+      'Un pais produce millones de cosas.',
+      'Vamos a resumirlas en un solo numero.',
+      'Coches, pan, cortes de pelo.',
+      'En 2023 la brecha fue mucho mayor.',
+    ]);
+  });
+
+  it('encadena las partes sumando su duración declarada', () => {
+    const script = parseVideoScript(guion);
+    const ultima = script.chapters.flatMap((chapter) => chapter.lines).at(-1)!;
+    // La parte 2 empieza en 00:40.0, así que 00:02.0 local son 42 s globales.
+    expect(ultima.startSec).toBeCloseTo(42, 3);
+    expect(ultima.endSec).toBeCloseTo(48.5, 3);
+    expect(script.totalDurationSec).toBeCloseTo(70, 3);
+  });
+
+  it('usa la duración real de cada subtítulo, no una estimación por palabras', () => {
+    const script = parseVideoScript(guion);
+    const primera = script.chapters[0].lines[0];
+    expect(primera.targetDurationSec).toBeCloseTo(4.4, 3);
+    expect(primera.sourceTimecode).toBe('00:00.7\u201300:05.1');
   });
 });

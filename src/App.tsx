@@ -21,6 +21,7 @@ import {
 import { base64ToWavBlob } from './utils/audio';
 import {
   createBlankProject,
+  createId,
   deleteProject,
   exportProject,
   importProject,
@@ -242,7 +243,7 @@ export default function App() {
       anchor.href = url;
       anchor.download = `${saved.name.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'proyecto'}.tav.json`;
       anchor.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
     } catch (error: any) {
       setErrorMsg(error?.message || 'No se pudo exportar el proyecto.');
     }
@@ -367,7 +368,7 @@ export default function App() {
       );
 
       const newAudioItem: GeneratedAudioItem = {
-        id: Date.now().toString(),
+        id: createId(),
         text,
         voice: selectedVoice,
         emotion: selectedEmotion,
@@ -507,8 +508,9 @@ export default function App() {
           </div>
         )}
 
-        {/* App Mode Conditional Views */}
-        {appMode === 'script' ? (
+        {/* El estudio sigue montado aunque se cambie de pestaña: al desmontarlo se
+            perderían los audios por bloque y la pista máster ya generados. */}
+        <div className={appMode === 'script' ? undefined : 'hidden'}>
           <VideoScriptStudio
             scriptText={scriptText}
             onScriptTextChange={setScriptText}
@@ -519,8 +521,10 @@ export default function App() {
             speakers={speakers}
             onAddToHistory={(item) => setHistory((prev) => [item, ...prev])}
           />
-        ) : (
-          /* Primary 2-Column Grid for Standard TTS */
+        </div>
+
+        <div className={appMode === 'script' ? 'hidden' : undefined}>
+          {/* Primary 2-Column Grid for Standard TTS */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
             {/* Left Column: Text Input & Voice Controls */}
             <div className="lg:col-span-7 space-y-6">
@@ -600,7 +604,7 @@ export default function App() {
               </div>
             </div>
           </div>
-        )}
+        </div>
       </main>
 
       {/* Footer */}

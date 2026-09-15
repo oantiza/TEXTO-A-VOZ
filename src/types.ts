@@ -75,7 +75,7 @@ export interface ParsedScript {
   voiceInfo: string;
   totalDurationSec: number;
   chapters: ScriptChapter[];
-  sourceFormat?: 'frame-timed-markdown' | 'subtitles' | 'timestamped' | 'automatic';
+  sourceFormat?: 'frame-timed-markdown' | 'timed-markdown' | 'subtitles' | 'timestamped' | 'automatic';
   frameRate?: number;
 }
 
