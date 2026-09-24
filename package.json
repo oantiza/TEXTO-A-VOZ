@@ -8,6 +8,8 @@
   },
   "scripts": {
     "dev": "tsx server.ts",
+    "avatar": "cd avatar-service && .venv\\Scripts\\python.exe service.py",
+    "avatar:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File avatar-service/setup.ps1",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "gcp-build": "npm run build",
     "start": "node dist/server.cjs",

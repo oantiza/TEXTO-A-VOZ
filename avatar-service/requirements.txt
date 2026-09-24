@@ -1,0 +1,34 @@
+# Dependencias del servicio de vídeo con presentador (Python 3.10, Windows, GPU NVIDIA).
+# PyTorch se instala aparte desde el índice CUDA 12.8 (necesario para GPUs Blackwell / RTX 50xx):
+#   pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+# setup.ps1 hace ambos pasos.
+
+# Inferencia JoyVASA + LivePortrait (sin InsightFace: la detección facial es MediaPipe)
+numpy==2.2.6
+opencv-contrib-python==5.0.0.93
+mediapipe==1.0.1
+onnx==1.23.0
+onnxruntime-gpu==1.23.2
+transformers==4.46.3
+tokenizers==0.20.3
+safetensors==0.8.0
+librosa==0.11.0
+soundfile==0.14.0
+pykalman==0.11.2
+scipy==1.15.3
+scikit-image==0.25.2
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+matplotlib==3.10.9
+rich==15.0.0
+tyro==1.0.16
+PyYAML==6.0.3
+tqdm==4.70.1
+requests==2.34.2
+pillow==12.3.0
+huggingface_hub==0.36.2
+
+# Servicio HTTP
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32

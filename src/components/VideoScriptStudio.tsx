@@ -23,6 +23,7 @@ import {
   secondsToTimeString,
 } from '../utils/scriptParser';
 import { base64ToWavBlob, wavBlobToMp3Blob } from '../utils/audio';
+import { AvatarVideoExport } from './AvatarVideoExport';
 import {
   Video,
   Play,
@@ -1014,6 +1015,13 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
               )}
             </div>
           </div>
+
+          <AvatarVideoExport
+            key={masterAudioUrl}
+            variant="dark"
+            getAudio={async () => masterAudioBlob ?? (await fetch(masterAudioUrl)).blob()}
+            fileBaseName={`${parsedScript.title.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'locucion-master'}-presentador`}
+          />
 
           {/* Scrubber Timeline */}
           <div className="space-y-2">
