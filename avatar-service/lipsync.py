@@ -36,14 +36,17 @@ AUDIO_WINDOW = 2 * (2 * AUDIO_PADDING + 1)
 # Puntos de MediaPipe usados (malla de 478).
 JAW = [127, 234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152,
        377, 400, 378, 379, 365, 397, 288, 361, 323, 454, 356]
-NOSE_BRIDGE_LOW = 5  # equivale al punto 29 de los 68 de DWPose que usa MuseTalk
+NOSE_ANCHOR = 5  # centro vertical del recorte: equivalente al punto 29 de los 68 de DWPose
 SUBNASALE = 2  # base de la nariz: límite superior de la zona que se regenera
 # Radio (relativo al ancho del recuadro) que separa "forma" (MuseTalk) de "textura" (original):
 # mayor = más densidad y tono de barba recuperados.
 DETAIL_SIGMA = float(os.environ.get("AVATAR_DETAIL_SIGMA", "0.03"))
-MOUTH_SHARPEN = float(os.environ.get("AVATAR_MOUTH_SHARPEN", "0.6"))
-MOUTH_TOP_OFFSET = -0.02  # desplazamiento del límite superior de la boca (× ancho de labios, + = abajo)
-MOUTH_FEATHER = 0.10  # difuminado del borde de la boca (× ancho de labios)
+MOUTH_SHARPEN = float(os.environ.get("AVATAR_MOUTH_SHARPEN", "0.0"))
+MOUTH_TOP_OFFSET = -0.04  # desplazamiento del límite superior de la boca (× ancho de labios, + = abajo)
+MOUTH_FEATHER = 0.25  # difuminado del borde de la boca (× ancho de labios)
+# Puntos de los labios para el elevador del labio superior (UpperLipLifter).
+UPPER_LIP_OUTER, UPPER_LIP_INNER, LOWER_LIP_INNER = 0, 13, 14
+MOUTH_CORNERS = (61, 291)
 OUTER_LIPS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
 
 
@@ -141,14 +144,21 @@ class MuseTalkLipSync:
 
     # ---------------------------------------------------------------- red
     @torch.inference_mode()
-    def generate(self, crops: np.ndarray, audio: torch.Tensor) -> np.ndarray:
-        """crops: [B, 256, 256, 3] uint8 RGB -> bocas regeneradas con la misma forma."""
+    def generate(self, crops: np.ndarray, audio: torch.Tensor, references: np.ndarray | None = None) -> np.ndarray:
+        """crops: [B, 256, 256, 3] uint8 RGB -> bocas regeneradas con la misma forma.
+
+        references: imágenes de referencia de la cara (por defecto, los propios recortes).
+        """
         pixels = torch.from_numpy(crops).to(self.device).permute(0, 3, 1, 2).to(self.dtype) / 255.0
         masked = pixels.clone()
         masked[:, :, CROP_SIZE // 2:, :] = 0  # MuseTalk tapa la mitad inferior
         scaling = self.vae.config.scaling_factor
         masked_latents = self.vae.encode(masked * 2 - 1).latent_dist.mode() * scaling
-        ref_latents = self.vae.encode(pixels * 2 - 1).latent_dist.mode() * scaling
+        if references is None:
+            reference_pixels = pixels
+        else:
+            reference_pixels = torch.from_numpy(references).to(self.device).permute(0, 3, 1, 2).to(self.dtype) / 255.0
+        ref_latents = self.vae.encode(reference_pixels * 2 - 1).latent_dist.mode() * scaling
         latents = torch.cat([masked_latents, ref_latents], dim=1)
         audio_features = self.pe(audio.to(self.dtype))
         timesteps = torch.zeros(1, device=self.device)
@@ -191,7 +201,7 @@ class _FaceTracker:
 def _mouth_geometry(points: np.ndarray, width: int, height: int):
     """Recuadro al estilo MuseTalk y máscara de fusión de la parte baja de la cara."""
     jaw = points[JAW]
-    nose_y = points[NOSE_BRIDGE_LOW, 1]
+    nose_y = points[NOSE_ANCHOR, 1]
     chin_y = jaw[:, 1].max()
     half_face = chin_y - nose_y
     x1, x2 = int(jaw[:, 0].min()), int(math.ceil(jaw[:, 0].max()))
@@ -244,6 +254,72 @@ def _mouth_geometry(points: np.ndarray, width: int, height: int):
     mouth_mask = cv2.GaussianBlur(mouth_mask, (mouth_blur, mouth_blur), 0)
     detail_mask = 1.0 - mouth_mask
     return (x1, y1, x2, y2), mask[..., None], detail_mask[..., None]
+
+
+class UpperLipLifter:
+    """Eleva el labio superior en proporción a la apertura de la boca generada por MuseTalk.
+
+    Lee los puntos de los labios en cada fotograma ya fundido y aplica un desplazamiento
+    vertical suave: máximo en el borde interior del labio superior, nulo en la base de la nariz
+    y en el labio inferior, y atenuado hacia las comisuras. Úsese desde un único hilo.
+    """
+
+    def __init__(self, landmarker_model: Path, amount: float):
+        options = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(landmarker_model)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+        )
+        self.landmarker = vision.FaceLandmarker.create_from_options(options)
+        self.amount = amount
+        self.lift = _Smoother(alpha=0.6)
+
+    def close(self) -> None:
+        self.landmarker.close()
+
+    def __call__(self, frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        result = self.landmarker.detect(MpImage(image_format=ImageFormat.SRGB, data=np.ascontiguousarray(frame)))
+        if not result.face_landmarks:
+            return frame
+        face = result.face_landmarks[0]
+
+        def point(index):
+            return np.array([face[index].x * width, face[index].y * height])
+
+        left, right = point(MOUTH_CORNERS[0]), point(MOUTH_CORNERS[1])
+        mouth_width = np.linalg.norm(right - left)
+        subnasale, inner_top, inner_bottom = point(SUBNASALE), point(UPPER_LIP_INNER), point(LOWER_LIP_INNER)
+        opening = max(0.0, inner_bottom[1] - inner_top[1] - 0.03 * mouth_width)
+        lift = float(self.lift(np.array([self.amount * opening]))[0])
+        if lift < 0.3:
+            return frame
+
+        x0 = int(max(0, left[0] - 0.15 * mouth_width))
+        x1 = int(min(width, right[0] + 0.15 * mouth_width))
+        y0 = int(max(0, subnasale[1]))
+        y1 = int(min(height, inner_bottom[1] + 2))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return frame
+        ys, xs = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        # Peso vertical: 0 en la nariz -> 1 en el borde interior del labio superior -> 0 en el inferior.
+        rise = np.clip((ys - subnasale[1]) / max(1.0, inner_top[1] - subnasale[1]), 0, 1)
+        fall = np.clip((inner_bottom[1] - ys) / max(1.0, inner_bottom[1] - inner_top[1]), 0, 1)
+        weight_y = np.where(ys <= inner_top[1], 0.5 - 0.5 * np.cos(np.pi * rise), 0.5 - 0.5 * np.cos(np.pi * fall))
+        # Peso horizontal: coseno alzado entre las comisuras (ampliadas un 15 %).
+        center_x = 0.5 * (left[0] + right[0])
+        half = 0.5 * mouth_width * 1.15
+        weight_x = 0.5 + 0.5 * np.cos(np.pi * np.clip((xs - center_x) / half, -1, 1))
+        # Se muestrea de más abajo: el contenido sube. Desplazamiento solo vertical, interpolado a
+        # mano (cv2.remap de OpenCV 5.0 tarda ~0,7 s incluso en recortes pequeños).
+        source_y = np.clip(ys + lift * weight_x * weight_y, 0, height - 1.001)
+        row = np.floor(source_y).astype(np.int32)
+        frac = (source_y - row)[..., None]
+        columns = xs.astype(np.int32)
+        warped = (1 - frac) * frame[row, columns] + frac * frame[row + 1, columns]
+        out = frame.copy()
+        out[y0:y1, x0:x1] = np.clip(warped + 0.5, 0, 255).astype(np.uint8)
+        return out
 
 
 def crop_for_model(frame: np.ndarray, box) -> np.ndarray:

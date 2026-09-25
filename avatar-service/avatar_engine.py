@@ -57,8 +57,11 @@ from src.utils.io import load_image_rgb, resize_to_limit  # noqa: E402
 torch.backends.cudnn.benchmark = True
 
 MOTION_FPS = 25
-# Índices de expresión de LivePortrait que controlan los labios (igual que en JoyVASA).
+# Índices de expresión de LivePortrait que controlan los labios (igual que en JoyVASA) y los
+# párpados (los de LivePortrait; comprobados midiendo su correlación con el parpadeo).
 LIP_EXP_INDICES = [6, 12, 14, 17, 19, 20]
+EYE_EXP_INDICES = [11, 13, 15, 16, 18]
+FACE_EXP_INDICES = [index for index in range(21) if index not in LIP_EXP_INDICES + EYE_EXP_INDICES]
 
 ProgressCallback = Callable[[str, float], None]
 
@@ -275,9 +278,19 @@ class RenderSettings:
     cfg_scale: float = 4.0
     # Intensidad de los gestos que no son de la boca (ojos, cejas): 1 = la de JoyVASA.
     expression_scale: float = 0.6
+    # Suavizado temporal (sigma en fotogramas a 25 fps) de la expresión que no es de la boca.
+    # JoyVASA la genera con ruido fotograma a fotograma: sin filtrar, la cara "tiembla".
+    # Medido (temblor de puntos rígidos de la cabeza): 1,11 px sin filtro -> 0,48 px con 6/1,
+    # conservando los parpadeos (con expresión congelada: 0,32 px, pero sin parpadeos).
+    expression_smoothing: float = 6.0
+    eye_smoothing: float = 1.0
     # "musetalk": la boca la regenera MuseTalk a partir del audio (LivePortrait deja los labios
     # quietos). "joyvasa": labios de JoyVASA, articulan poco; solo como alternativa.
     lip_sync: str = "musetalk"
+    # Elevación del labio superior (fracción de la apertura de la boca), solo con MuseTalk: este
+    # mueve sobre todo mandíbula y labio inferior (medido: superior ~8,8 px de recorrido frente a
+    # ~17 px del inferior; con 0,6 el superior pasa a ~11,9 px sin deformar el bigote).
+    upper_lip_lift: float = float(os.environ.get("AVATAR_UPPER_LIP_LIFT", "0.6"))
     # Amplificación de los labios de JoyVASA (solo con lip_sync="joyvasa").
     lip_scale: float = 1.0
     crf: int = 18
@@ -316,17 +329,19 @@ def _generate_mouths(lipsync, tracker, frames: list[np.ndarray], audio_prompts: 
     return list(zip(frames, mouths, geometry))
 
 
-def _blend_mouths(items) -> list[np.ndarray]:
-    """Parte de CPU: funde cada boca regenerada con su fotograma (recuperando la barba)."""
+def _blend_mouths(items, lifter=None) -> list[np.ndarray]:
+    """Parte de CPU: funde cada boca regenerada con su fotograma (recuperando la barba) y, si
+    procede, eleva el labio superior según la apertura de la boca."""
     from lipsync import blend
 
     result = []
     for frame, mouth, geometry in items:
         if mouth is None:
             result.append(frame)
-        else:
-            box, mask, detail_mask = geometry
-            result.append(blend(frame, mouth, box, mask, detail_mask))
+            continue
+        box, mask, detail_mask = geometry
+        blended = blend(frame, mouth, box, mask, detail_mask)
+        result.append(lifter(blended) if lifter is not None else blended)
     return result
 
 
@@ -334,26 +349,33 @@ class _FrameWriter:
     """Hilo que funde las bocas y envía los fotogramas a ffmpeg mientras la GPU sigue
     renderizando el lote siguiente (la fusión y la escritura son CPU)."""
 
-    def __init__(self, encoder: subprocess.Popen):
+    def __init__(self, encoder: subprocess.Popen, lifter_factory=None):
         self.encoder = encoder
+        self.lifter_factory = lifter_factory
         self.queue: "queue.Queue" = queue.Queue(maxsize=2)
         self.error: BaseException | None = None
         self.thread = threading.Thread(target=self._run, name="frame-writer", daemon=True)
         self.thread.start()
 
     def _run(self) -> None:
-        while True:
-            item = self.queue.get()
-            if item is None:
-                return
-            if self.error is not None:
-                continue
-            try:
-                frames = _blend_mouths(item) if isinstance(item[0], tuple) else item
-                for frame in frames:
-                    self.encoder.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
-            except BaseException as exc:  # se relanza en el hilo principal
-                self.error = exc
+        # El detector de MediaPipe del elevador de labio se crea y se usa solo en este hilo.
+        lifter = self.lifter_factory() if self.lifter_factory is not None else None
+        try:
+            while True:
+                item = self.queue.get()
+                if item is None:
+                    return
+                if self.error is not None:
+                    continue
+                try:
+                    frames = _blend_mouths(item, lifter) if isinstance(item[0], tuple) else item
+                    for frame in frames:
+                        self.encoder.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+                except BaseException as exc:  # se relanza en el hilo principal
+                    self.error = exc
+        finally:
+            if lifter is not None:
+                lifter.close()
 
     def put(self, item) -> None:
         if self.error is not None:
@@ -365,6 +387,21 @@ class _FrameWriter:
         self.thread.join()
         if self.error is not None:
             raise self.error
+
+
+def _smooth_expression(motion: list[dict], sigma_face: float, sigma_eyes: float) -> list[dict]:
+    """Filtro gaussiano temporal de la expresión, salvo los labios (la pose ya viene suavizada).
+
+    Los párpados llevan un filtro mucho más ligero: un parpadeo dura 3-4 fotogramas y con el
+    filtro del resto de la cara se vería a cámara lenta.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    expressions = np.stack([frame["exp"] for frame in motion])  # [T, 1, 21, 3]
+    for indices, sigma in ((FACE_EXP_INDICES, sigma_face), (EYE_EXP_INDICES, sigma_eyes)):
+        if sigma > 0:
+            expressions[:, :, indices] = gaussian_filter1d(expressions[:, :, indices], sigma, axis=0, mode="nearest")
+    return [{**frame, "exp": expressions[index]} for index, frame in enumerate(motion)]
 
 
 def _resample_motion(motion: list[dict], source_fps: int, target_fps: int, frame_count: int) -> list[dict]:
@@ -510,6 +547,8 @@ class AvatarEngine:
         report("Generando el movimiento a partir del audio", 0.05)
         motion_args = _MotionArgs(audio=str(audio_path), cfg_scale=settings.cfg_scale)
         motion = wrapper.gen_motion_sequence(motion_args)["motion"]
+        if settings.expression_smoothing > 0 or settings.eye_smoothing > 0:
+            motion = _smooth_expression(motion, settings.expression_smoothing, settings.eye_smoothing)
         audio_duration = _probe_duration(audio_path)
         if audio_duration <= 0.05:
             raise AvatarError("El audio está vacío o es demasiado corto.")
@@ -574,7 +613,12 @@ class AvatarEngine:
         )
 
         tracker = self.lipsync.new_tracker() if use_musetalk else None
-        writer = _FrameWriter(encoder)
+        lifter_factory = None
+        if use_musetalk and settings.upper_lip_lift > 0:
+            from lipsync import UpperLipLifter
+
+            lifter_factory = lambda: UpperLipLifter(FACE_LANDMARKER_MODEL, settings.upper_lip_lift)  # noqa: E731
+        writer = _FrameWriter(encoder, lifter_factory)
         pending: list[np.ndarray] = []
 
         def write_frames(frames: list[np.ndarray], first_index: int) -> None:

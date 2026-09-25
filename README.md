@@ -163,7 +163,10 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 | `AVATAR_MAX_AUDIO_SEC` | `1200` | Duración máxima del audio (servicio Python) |
 | `AVATAR_EXPRESSION_SCALE` | `0.6` | Intensidad de ojos y cejas (1 = JoyVASA original; los labios no cambian) |
 | `AVATAR_DETAIL_SIGMA` | `0.03` | Cuánta textura (barba, piel) se recupera del original en la zona regenerada por MuseTalk |
-| `AVATAR_MOUTH_SHARPEN` | `0.6` | Enfoque de la boca generada por MuseTalk (0 = sin enfoque) |
+| `AVATAR_UPPER_LIP_LIFT` | `0.6` | Cuánto sube el labio superior al abrirse la boca (MuseTalk casi solo mueve el inferior; 0 = desactivado) |
+| `AVATAR_MOUTH_SHARPEN` | `0` | Enfoque opcional de la boca generada por MuseTalk |
+
+La expresión que genera JoyVASA (cejas, mejillas, contorno) llega con ruido de un fotograma a otro, y sin filtrar la cabeza «tiembla». El motor la suaviza en el tiempo, con un filtro mucho más ligero en los párpados para no frenar los parpadeos. Medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,49 a 0,05 px de media.
 | `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |
 
 **Uso responsable:** usa solo imágenes de personas que hayan dado su consentimiento. Si el vídeo se publica, indica que ha sido generado con IA; el Reglamento Europeo de IA lo exige para contenido sintético de personas.
