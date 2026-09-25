@@ -6,3 +6,14 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Servicio de vídeo con presentador (local, GPU): entorno, modelos y datos no se versionan
+avatar-service/.venv/
+avatar-service/JoyVASA/
+avatar-service/MuseTalk/
+avatar-service/ditto/
+avatar-service/jobs/
+avatar-service/test-output/
+avatar-service/presenter/*
+!avatar-service/presenter/README.md
+__pycache__/

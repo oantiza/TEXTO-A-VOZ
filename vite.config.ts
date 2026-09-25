@@ -20,7 +20,9 @@ export default defineConfig(() => {
       // File watching can be disabled to prevent flickering during automated edits.
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // avatar-service/ (entorno Python, modelos y MP4 generados) no forma parte del front:
+      // vigilarlo saturaba el watcher y recargaba la página en mitad de un vídeo.
+      watch: process.env.DISABLE_HMR === 'true' ? null : { ignored: ['**/avatar-service/**'] },
     },
   };
 });

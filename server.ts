@@ -4,6 +4,8 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { Readable } from 'node:stream';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import { splitTextForStableTts } from './src/utils/ttsChunking';
 
 const dotenvValues = dotenv.config().parsed ?? {};
@@ -34,6 +36,54 @@ const ALLOWED_ACCENTS = ['spain', 'latam', 'argentina', 'neutral'] as const;
 const ACCESS_PASSWORD = process.env.APP_ACCESS_PASSWORD?.trim() || '';
 const SESSION_COOKIE = 'texto_a_voz_session';
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
+const AVATAR_SERVICE_URL = (process.env.AVATAR_SERVICE_URL?.trim() || 'http://127.0.0.1:8765').replace(/\/+$/, '');
+const AVATAR_SERVICE_TOKEN = process.env.AVATAR_SERVICE_TOKEN?.trim() || '';
+const AVATAR_MAX_UPLOAD_BYTES = 450 * 1024 * 1024;
+const AVATAR_JOB_ID = /^[a-f0-9]{32}$/;
+
+// El vídeo con presentador necesita la GPU del PC (servicio Python local). Cloud Run define
+// siempre K_SERVICE y no tiene GPU, así que allí la función se desactiva sin tocar el resto.
+function avatarUnavailableReason(): string | null {
+  if (process.env.K_SERVICE || process.env.K_REVISION) {
+    return 'El vídeo con presentador solo funciona con la app en local: necesita la GPU del PC y Cloud Run no tiene.';
+  }
+  if (process.env.AVATAR_ENABLED === 'false') {
+    return 'La generación de vídeo está desactivada en este servidor (AVATAR_ENABLED=false).';
+  }
+  return null;
+}
+
+class AvatarServiceUnreachableError extends Error {}
+
+async function avatarServiceFetch(servicePath: string, init: RequestInit & { duplex?: 'half' } = {}) {
+  const headers = new Headers(init.headers);
+  if (AVATAR_SERVICE_TOKEN) headers.set('X-Avatar-Token', AVATAR_SERVICE_TOKEN);
+  try {
+    return await fetch(`${AVATAR_SERVICE_URL}${servicePath}`, { ...init, headers });
+  } catch (err) {
+    throw new AvatarServiceUnreachableError(String((err as Error)?.message || err));
+  }
+}
+
+async function relayAvatarJson(upstream: Response, res: express.Response) {
+  const body: any = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) {
+    const detail = typeof body?.detail === 'string' ? body.detail : 'El servicio de vídeo devolvió un error.';
+    return res.status(upstream.status).json({ error: detail });
+  }
+  return res.status(upstream.status).json(body);
+}
+
+function sendAvatarProxyError(err: unknown, res: express.Response) {
+  if (err instanceof AvatarServiceUnreachableError) {
+    return res.status(502).json({
+      error: 'No se pudo contactar con el servicio de vídeo local. Arráncalo con "npm run avatar".',
+      avatarServiceDown: true,
+    });
+  }
+  console.error('[Avatar] Error en el puente:', err);
+  return res.status(500).json({ error: 'Error inesperado al comunicar con el servicio de vídeo.' });
+}
 
 interface RateLimitEntry {
   count: number;
@@ -548,6 +598,115 @@ async function startServer() {
           ? `No se pudo generar el audio: ${upstreamDetail.slice(0, 160)}`
           : 'No se pudo generar el audio. Reintenta en unos segundos.',
       });
+    }
+  });
+
+  // Vídeo con presentador (lip-sync): puente hacia el servicio Python local de avatar-service/.
+  app.use('/api/avatar', (req, res, next) => {
+    if (!isAuthenticated(req.headers.cookie)) {
+      return res.status(401).json({ error: 'Inicia sesión para generar vídeo.' });
+    }
+    const reason = avatarUnavailableReason();
+    if (reason && !(req.method === 'GET' && req.path === '/status')) {
+      return res.status(503).json({ error: reason, avatarUnavailable: true });
+    }
+    next();
+  });
+
+  app.get('/api/avatar/status', async (req, res) => {
+    const reason = avatarUnavailableReason();
+    if (reason) return res.json({ available: false, reason });
+    try {
+      const upstream = await avatarServiceFetch('/health', { signal: AbortSignal.timeout(2_500) });
+      const health: any = await upstream.json();
+      if (health.status === 'loading') {
+        return res.json({ available: false, loading: true, reason: 'El servicio de vídeo está cargando los modelos en la GPU…' });
+      }
+      if (health.status !== 'ready') {
+        return res.json({ available: false, reason: `El servicio de vídeo no pudo arrancar: ${health.error || 'error desconocido'}` });
+      }
+      res.json({
+        available: true,
+        device: health.device,
+        defaultPresenter: Boolean(health.defaultPresenter),
+        maxAudioSec: health.maxAudioSec,
+      });
+    } catch {
+      res.json({
+        available: false,
+        serviceDown: true,
+        reason: 'El servicio de vídeo local no está arrancado. Ábrelo con "npm run avatar".',
+      });
+    }
+  });
+
+  app.get('/api/avatar/presenter', async (req, res) => {
+    try {
+      const upstream = await avatarServiceFetch('/presenter');
+      if (!upstream.ok || !upstream.body) return relayAvatarJson(upstream, res);
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'image/png');
+      res.setHeader('Cache-Control', 'no-store');
+      Readable.fromWeb(upstream.body as WebReadableStream).pipe(res);
+    } catch (err) {
+      sendAvatarProxyError(err, res);
+    }
+  });
+
+  // El cuerpo multipart (WAV + imagen opcional) se reenvía en streaming, sin cargarlo en memoria.
+  app.post('/api/avatar', async (req, res) => {
+    const contentType = req.headers['content-type'] || '';
+    if (!contentType.startsWith('multipart/form-data')) {
+      return res.status(400).json({ error: 'Envía el audio como multipart/form-data.' });
+    }
+    if (Number(req.headers['content-length'] || 0) > AVATAR_MAX_UPLOAD_BYTES) {
+      return res.status(413).json({ error: 'El audio y la imagen superan el tamaño máximo para vídeo.' });
+    }
+    try {
+      const upstream = await avatarServiceFetch('/jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': contentType,
+          ...(req.headers['content-length'] ? { 'Content-Length': String(req.headers['content-length']) } : {}),
+        },
+        body: Readable.toWeb(req) as unknown as BodyInit,
+        duplex: 'half',
+      });
+      await relayAvatarJson(upstream, res);
+    } catch (err) {
+      sendAvatarProxyError(err, res);
+    }
+  });
+
+  app.get('/api/avatar/:jobId', async (req, res) => {
+    if (!AVATAR_JOB_ID.test(req.params.jobId)) return res.status(400).json({ error: 'Identificador de vídeo no válido.' });
+    try {
+      await relayAvatarJson(await avatarServiceFetch(`/jobs/${req.params.jobId}`), res);
+    } catch (err) {
+      sendAvatarProxyError(err, res);
+    }
+  });
+
+  app.get('/api/avatar/:jobId/video', async (req, res) => {
+    if (!AVATAR_JOB_ID.test(req.params.jobId)) return res.status(400).json({ error: 'Identificador de vídeo no válido.' });
+    try {
+      const upstream = await avatarServiceFetch(`/jobs/${req.params.jobId}/video`);
+      if (!upstream.ok || !upstream.body) return relayAvatarJson(upstream, res);
+      res.setHeader('Content-Type', 'video/mp4');
+      const length = upstream.headers.get('content-length');
+      if (length) res.setHeader('Content-Length', length);
+      res.setHeader('Content-Disposition', 'attachment; filename="presentador.mp4"');
+      Readable.fromWeb(upstream.body as WebReadableStream).pipe(res);
+    } catch (err) {
+      sendAvatarProxyError(err, res);
+    }
+  });
+
+  app.delete('/api/avatar/:jobId', async (req, res) => {
+    if (!AVATAR_JOB_ID.test(req.params.jobId)) return res.status(400).json({ error: 'Identificador de vídeo no válido.' });
+    try {
+      await relayAvatarJson(await avatarServiceFetch(`/jobs/${req.params.jobId}`, { method: 'DELETE' }), res);
+    } catch (err) {
+      sendAvatarProxyError(err, res);
     }
   });
 

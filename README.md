@@ -16,6 +16,7 @@ Aplicación en español para convertir texto y guiones de vídeo en locuciones, 
 - Proyectos guardados automáticamente en el navegador, incluidos los audios.
 - Copias completas de proyecto en archivos `.tav.json`.
 - Aplicación web instalable (PWA) y acceso privado opcional mediante contraseña.
+- Vídeo MP4 de un presentador hablando con lip-sync sobre la locución (solo en local, con GPU NVIDIA).
 
 ## Recomendación de uso
 
@@ -87,6 +88,100 @@ Para el máster final, usa **Natural por bloques · Flash**. Cada bloque se inte
 
 Gemini entrega actualmente PCM nativo a 24 kHz. La aplicación realiza una única conversión de alta calidad y descarga el WAV de producción a 48 kHz, mono y 16 bits, con margen de pico para la mezcla.
 
+## Vídeo con presentador (solo en local)
+
+Junto a las descargas WAV/MP3 aparece el panel **Vídeo con presentador**. Anima una imagen fija de un busto para que hable con sincronía labial sobre la locución recién generada y entrega un MP4 H.264 a 30 fps con color BT.709 y audio AAC a 48 kHz, listo para subir a YouTube. Formatos:
+
+- **YouTube 16:9** (1920×1080, por defecto): si la foto no es 16:9, se encuadra sola en la mayor ventana 16:9 centrada en la cara y sin cortar el pelo.
+- **Vertical 9:16** (1080×1920) para Shorts o Reels.
+- **Como la imagen**: respeta la proporción de la foto (lado mayor hasta 1920 px).
+
+Para un plano medio (cabeza y pecho) en YouTube, usa una foto 16:9 de al menos 1920×1080. Una foto casi cuadrada da un primer plano de la cabeza hasta el cuello de la camisa.
+
+Funciona con un segundo servidor, en Python, que usa la GPU del PC:
+
+- [Ditto](https://github.com/antgroup/ditto-talkinghead) (Ant Group, Apache 2.0, código y pesos) convierte el audio en movimiento de boca y cabeza con un modelo de difusión condicionado por HuBERT, y [LivePortrait](https://github.com/KwaiVGI/LivePortrait) (MIT) renderiza la cara a plena resolución. Los labios salen nítidos, con dientes y con parpadeos naturales.
+- La detección facial usa MediaPipe (Apache 2.0). No se descargan los modelos de InsightFace que Ditto trae de serie, porque son solo para uso no comercial. Así, toda la cadena es gratuita y admite uso comercial.
+- Alternativa (`AVATAR_MOTION_ENGINE=joyvasa`): [JoyVASA](https://github.com/jdh-algo/JoyVASA) para cabeza y ojos con [MuseTalk 1.5](https://github.com/TMElyralab/MuseTalk) regenerando la boca (ambos MIT, pesos aptos para uso comercial). Se conserva por si hiciera falta, pero MuseTalk genera la boca a 256 px, más blanda y con algo de vibración.
+- Cloud Run no tiene GPU. Allí la función se desactiva automáticamente (detecta `K_SERVICE`) y el resto de la app sigue igual.
+
+### Instalación (una vez)
+
+Requisitos: Windows, GPU NVIDIA con driver reciente (probado con RTX 5070 Ti), Python 3.10 (`py -3.10`) y Git. Descarga unos 11 GB.
+
+```powershell
+npm run avatar:setup
+```
+
+El script crea `avatar-service\.venv`, instala PyTorch con CUDA 12.8 (necesario para las RTX 50xx), clona Ditto, JoyVASA y MuseTalk en versiones fijas, descarga solo los pesos con licencia apta para uso comercial e instala ffmpeg si falta. Se puede repetir sin problema.
+
+Después coloca la imagen del presentador en `avatar-service\presenter\` (PNG/JPG/WEBP). Consulta [avatar-service/presenter/README.md](avatar-service/presenter/README.md) para ver cómo prepararla. Desde la app también se puede elegir otra imagen para la sesión con **Cambiar imagen**.
+
+### Arranque en desarrollo (dos terminales)
+
+```powershell
+# Terminal 1: servicio de vídeo (tarda ~30 s en cargar los modelos y calentar la GPU)
+npm run avatar
+```
+
+```powershell
+# Terminal 2: la app de siempre
+npm run dev
+```
+
+Abre [http://localhost:3000](http://localhost:3000). Si el servicio de vídeo no está arrancado, el panel lo indica y se activa solo cuando el servicio queda listo. La app funciona igual sin él.
+
+### Cómo funciona
+
+```
+Navegador ──WAV──▶ Express /api/avatar ──▶ FastAPI 127.0.0.1:8765 (cola, 1 GPU)
+          ◀──MP4──                     ◀── Ditto (audio → movimiento) + LivePortrait + ffmpeg
+```
+
+- `POST /api/avatar` reenvía el WAV (y la imagen, si se ha cambiado) al servicio y devuelve un identificador de trabajo.
+- `GET /api/avatar/:id` informa del progreso, `GET /api/avatar/:id/video` descarga el MP4 y `DELETE /api/avatar/:id` cancela el trabajo.
+- `GET /api/avatar/status` indica si la función está disponible y por qué no lo está.
+- Los trabajos se procesan de uno en uno y los MP4 se borran a las 24 horas (`avatar-service\jobs\`).
+
+Rendimiento medido con una RTX 5070 Ti a 1080p: 15,6 s de audio se generan en unos 31 s, unas 2 veces la duración del audio. Por extrapolación, una locución de 3 minutos tardaría unos 6 minutos. El servicio ocupa unos 7 GB de VRAM.
+
+Prueba por línea de comandos, sin servidores:
+
+```powershell
+cd avatar-service
+.venv\Scripts\python.exe cli.py --image presenter\mi-busto.png --audio locucion.wav --out prueba.mp4
+```
+
+Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
+
+| Variable | Por defecto | Uso |
+|---|---|---|
+| `AVATAR_SERVICE_URL` | `http://127.0.0.1:8765` | Dirección del servicio de vídeo |
+| `AVATAR_SERVICE_TOKEN` | vacío | Secreto compartido entre Node y Python |
+| `AVATAR_ENABLED` | `true` | `false` oculta la función también en local |
+| `AVATAR_MAX_AUDIO_SEC` | `1200` | Duración máxima del audio (servicio Python) |
+| `AVATAR_MOTION_ENGINE` | `ditto` | Motor de movimiento: `ditto` o `joyvasa` (JoyVASA + MuseTalk) |
+| `AVATAR_POSE_SMOOTHING` | `6` | Suavizado temporal de la pose que genera Ditto (sigma en fotogramas a 25 fps; 0 = sin filtro) |
+| `AVATAR_AUDIO_LEAD_MS` | `120` | Adelanto del movimiento de Ditto respecto a la voz, en ms (súbelo si la boca va tarde; bájalo si se adelanta) |
+| `AVATAR_GUIDANCE` | `3` | Cuánto obedece al audio el modelo de movimiento de Ditto (Ditto usa 2; más = boca más marcada) |
+| `AVATAR_LIP_SCALE` | `1` | Amplificación del movimiento de los labios respecto a la boca en reposo |
+| `AVATAR_LIP_SMOOTHING` | `0` | Suavizado temporal de los labios de Ditto. Desactivado: cualquier valor apreciable borra la articulación por sílabas |
+| `AVATAR_EXPRESSION_SCALE` | `0.6` | Solo motor `joyvasa`: intensidad de ojos y cejas (1 = JoyVASA original) |
+| `AVATAR_DETAIL_SIGMA` | `0.03` | Solo motor `joyvasa`: textura (barba, piel) recuperada del original en la zona regenerada por MuseTalk |
+| `AVATAR_UPPER_LIP_LIFT` | `0.6` | Solo motor `joyvasa`: cuánto sube el labio superior al abrirse la boca (0 = desactivado) |
+| `AVATAR_MOUTH_SHARPEN` | `1.2` | Solo motor `joyvasa`: enfoque de la boca generada por MuseTalk (0 = sin enfoque) |
+| `AVATAR_MOUTH_SMOOTHING` | `0.5` | Solo motor `joyvasa`: media móvil de la boca de MuseTalk (0 = sin suavizar); el audio se adelanta para compensar el retraso |
+| `AVATAR_BOX_SMOOTHING` | `0.2` | Solo motor `joyvasa`: suavizado del recuadro de la cara que se envía a MuseTalk (1 = sin suavizar) |
+
+Estabilizaciones que conviene conocer:
+
+- Ditto genera la pose (giros y desplazamiento de la cabeza) con algo de ruido de un fotograma a otro. El motor la suaviza en el tiempo; medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,17 a 0,07 px de media. La boca y los parpadeos no pasan por ese filtro: suavizar los labios, aunque sea poco, elimina la modulación por sílabas (medida como la energía de la apertura de la boca entre 3 y 8 Hz: 16 % sin filtro, 5 % con un filtro de 1,2 fotogramas).
+- La boca de Ditto llega unos 100–130 ms tarde respecto a la voz (medido comparando la apertura de la boca con la de MuseTalk, que se entrena con una pérdida de sincronía). El motor adelanta el movimiento 120 ms al remuestrear, con precisión de subfotograma; con eso el desfase medido queda en 0 ms.
+- Con el motor `joyvasa`, la expresión de JoyVASA se suaviza (temblor de 0,49 a 0,05 px) y la boca de MuseTalk se estabiliza con una media móvil en el espacio latente, adelantando el audio un fotograma para compensar el retraso.
+| `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |
+
+**Uso responsable:** usa solo imágenes de personas que hayan dado su consentimiento. Si el vídeo se publica, indica que ha sido generado con IA; el Reglamento Europeo de IA lo exige para contenido sintético de personas.
+
 ## Versión de producción
 
 ```powershell
@@ -144,6 +239,7 @@ Consulta [SECURITY.md](SECURITY.md) para las medidas y limitaciones de despliegu
 ## Estructura principal
 
 - `src/`: interfaz, audio, guiones y almacenamiento local.
-- `server.ts`: servidor, protección de la clave y conexión con Gemini.
+- `server.ts`: servidor, protección de la clave, conexión con Gemini y puente `/api/avatar`.
+- `avatar-service/`: servicio Python local de vídeo con presentador (`service.py`, `avatar_engine.py`, `setup.ps1`).
 - `public/`: PWA, iconos y funcionamiento instalable.
 - `.github/workflows/ci.yml`: controles automáticos.

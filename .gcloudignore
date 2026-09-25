@@ -7,3 +7,6 @@ node_modules
 dist
 coverage
 *.log
+
+# El servicio de vídeo solo funciona en local (necesita GPU): nunca se despliega
+avatar-service/

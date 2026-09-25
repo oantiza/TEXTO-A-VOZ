@@ -23,6 +23,7 @@ import {
   secondsToTimeString,
 } from '../utils/scriptParser';
 import { base64ToWavBlob, wavBlobToMp3Blob } from '../utils/audio';
+import { AvatarVideoExport } from './AvatarVideoExport';
 import {
   Video,
   Play,
@@ -1015,6 +1016,13 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
             </div>
           </div>
 
+          <AvatarVideoExport
+            key={masterAudioUrl}
+            variant="dark"
+            getAudio={async () => masterAudioBlob ?? (await fetch(masterAudioUrl)).blob()}
+            fileBaseName={`${parsedScript.title.replace(/[^a-z0-9áéíóúüñ_-]+/gi, '-').replace(/^-|-$/g, '') || 'locucion-master'}-presentador`}
+          />
+
           {/* Scrubber Timeline */}
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs font-mono text-indigo-300">
@@ -1206,6 +1214,9 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                   <h4 className="text-sm font-bold text-slate-900">{chap.title}</h4>
                   <span className="text-[11px] font-medium text-slate-500">
                     Marca temporal: <span className="font-mono text-indigo-700 font-bold">{chap.timeRange}</span> · {chap.lines.length} {chap.lines.length === 1 ? 'frase' : 'frases'}
+                    {chap.lines.length > 0 && (
+                      <> · <span className="font-mono">{chap.lines[0].id}</span>–<span className="font-mono">{chap.lines[chap.lines.length - 1].id}</span></>
+                    )}
                   </span>
                 </div>
               </div>
@@ -1261,9 +1272,18 @@ export const VideoScriptStudio: React.FC<VideoScriptStudioProps> = ({
                     }`}
                   >
                     <div className="flex items-start space-x-3 flex-1 min-w-0">
-                      {/* Timestamp Badge */}
-                      <div className="bg-slate-100 px-2.5 py-1 rounded-lg font-mono text-xs font-bold text-slate-700 shrink-0 border border-slate-200">
-                        [{line.sourceTimecode?.split('–')[0] || secondsToTimeString(line.startSec)}]
+                      {/* Identificador y marca de tiempo. El identificador es el mismo que
+                          aparece en los avisos (LINE_38), para poder buscarlo con Ctrl+F. */}
+                      <div className="flex flex-col items-center gap-1 shrink-0">
+                        <span
+                          className="font-mono text-[10px] font-bold uppercase tracking-wider text-slate-400 select-all"
+                          title="Identificador del bloque: el que aparece en los avisos"
+                        >
+                          {line.id}
+                        </span>
+                        <div className="bg-slate-100 px-2.5 py-1 rounded-lg font-mono text-xs font-bold text-slate-700 border border-slate-200">
+                          [{line.sourceTimecode?.split('–')[0] || secondsToTimeString(line.startSec)}]
+                        </div>
                       </div>
 
                       <div className="space-y-1 flex-1">

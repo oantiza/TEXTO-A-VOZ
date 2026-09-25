@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect } from 'react';
 import { GeneratedAudioItem } from '../types';
 import { formatTime } from '../utils/audio';
 import { wavBlobToMp3Blob } from '../utils/audio';
+import { AvatarVideoExport } from './AvatarVideoExport';
 import {
   Play,
   Pause,
@@ -260,6 +261,12 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({ currentAudio }) => {
           </button>
         </div>
       </div>
+
+      <AvatarVideoExport
+        key={currentAudio.id}
+        getAudio={async () => currentAudio.audioBlob ?? (await fetch(currentAudio.audioUrl)).blob()}
+        fileBaseName={`presentador-${currentAudio.voice.toLowerCase()}`}
+      />
 
       {/* Waveform & Canvas */}
       <div className="bg-slate-50 rounded-xl p-4 border border-slate-100 flex flex-col items-center space-y-3">
