@@ -6,6 +6,8 @@ $ErrorActionPreference = 'Stop'
 $ServiceDir = $PSScriptRoot
 $JoyVasaDir = Join-Path $ServiceDir 'JoyVASA'
 $JoyVasaCommit = '916a90f8de490e8648fee460c1200bd5d9a795af'
+$MuseTalkDir = Join-Path $ServiceDir 'MuseTalk'
+$MuseTalkCommit = '0a89dec45a0192b824e3cf4daf96c239440c5ed8'
 $Weights = Join-Path $JoyVasaDir 'pretrained_weights'
 $Python = Join-Path $ServiceDir '.venv\Scripts\python.exe'
 $env:HF_HUB_DISABLE_PROGRESS_BARS = '1'
@@ -43,6 +45,13 @@ if (-not (Test-Path $JoyVasaDir)) {
 Run git -C $JoyVasaDir fetch --quiet origin
 Run git -C $JoyVasaDir -c advice.detachedHead=false checkout --quiet $JoyVasaCommit
 
+Step "Clonando MuseTalk ($($MuseTalkCommit.Substring(0, 7)))"
+if (-not (Test-Path $MuseTalkDir)) {
+    Run git clone https://github.com/TMElyralab/MuseTalk.git $MuseTalkDir
+}
+Run git -C $MuseTalkDir fetch --quiet origin
+Run git -C $MuseTalkDir -c advice.detachedHead=false checkout --quiet $MuseTalkCommit
+
 Step 'Creando el entorno virtual (.venv, Python 3.10)'
 if (-not (Test-Path $Python)) { Run py -3.10 -m venv (Join-Path $ServiceDir '.venv') }
 Run $Python -m pip install --quiet --upgrade pip wheel "setuptools<81"
@@ -69,6 +78,16 @@ w = r'$Weights'
 snapshot_download('KwaiVGI/LivePortrait', local_dir=w, allow_patterns=['liveportrait/*'])
 snapshot_download('jdh-algo/JoyVASA', local_dir=w + r'\JoyVASA', allow_patterns=['motion_generator/*', 'motion_template/*'])
 snapshot_download('TencentGameMate/chinese-hubert-base', local_dir=w + r'\chinese-hubert-base', allow_patterns=['config.json', 'preprocessor_config.json', 'pytorch_model.bin'])
+"@
+# - MuseTalk 1.5 (MIT), sd-vae-ft-mse (MIT) y Whisper-tiny (Apache 2.0). No se descargan DWPose,
+#   S3FD ni face-parse-bisent (este último entrenado con datos solo no comerciales): los sustituye MediaPipe.
+$MuseTalkModels = Join-Path $MuseTalkDir 'models'
+Run $Python -c @"
+from huggingface_hub import snapshot_download
+m = r'$MuseTalkModels'
+snapshot_download('TMElyralab/MuseTalk', local_dir=m, allow_patterns=['musetalkV15/*'])
+snapshot_download('stabilityai/sd-vae-ft-mse', local_dir=m + r'\sd-vae', allow_patterns=['config.json', 'diffusion_pytorch_model.safetensors'])
+snapshot_download('openai/whisper-tiny', local_dir=m + r'\whisper', allow_patterns=['config.json', 'model.safetensors', 'preprocessor_config.json'])
 "@
 $Landmarker = Join-Path $Weights 'mediapipe\face_landmarker.task'
 if (-not (Test-Path $Landmarker)) {

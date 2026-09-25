@@ -16,6 +16,7 @@ import argparse
 import math
 import os
 import pathlib
+import queue
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,8 @@ SERVICE_DIR = Path(__file__).resolve().parent
 JOYVASA_DIR = Path(os.environ.get("JOYVASA_DIR", SERVICE_DIR / "JoyVASA")).resolve()
 WEIGHTS_DIR = JOYVASA_DIR / "pretrained_weights"
 FACE_LANDMARKER_MODEL = WEIGHTS_DIR / "mediapipe" / "face_landmarker.task"
+MUSETALK_UNET = SERVICE_DIR / "MuseTalk" / "models" / "musetalkV15" / "unet.pth"
+LIPSYNC_BATCH = 16
 
 if str(JOYVASA_DIR) not in sys.path:
     sys.path.insert(0, str(JOYVASA_DIR))
@@ -272,6 +275,11 @@ class RenderSettings:
     cfg_scale: float = 4.0
     # Intensidad de los gestos que no son de la boca (ojos, cejas): 1 = la de JoyVASA.
     expression_scale: float = 0.6
+    # "musetalk": la boca la regenera MuseTalk a partir del audio (LivePortrait deja los labios
+    # quietos). "joyvasa": labios de JoyVASA, articulan poco; solo como alternativa.
+    lip_sync: str = "musetalk"
+    # Amplificación de los labios de JoyVASA (solo con lip_sync="joyvasa").
+    lip_scale: float = 1.0
     crf: int = 18
 
 
@@ -283,6 +291,80 @@ class RenderResult:
     fps: int
     frames: int
     duration_sec: float
+
+
+def _generate_mouths(lipsync, tracker, frames: list[np.ndarray], audio_prompts: torch.Tensor, first_index: int):
+    """Parte de GPU del lip-sync para un lote: localiza la cara y regenera la boca con MuseTalk.
+
+    Devuelve [(fotograma, boca, geometría)] para fundir después (en otro hilo). El lote se rellena
+    siempre hasta LIPSYNC_BATCH: cada tamaño nuevo obliga a cuDNN a recalibrar (segundos).
+    """
+    from lipsync import crop_for_model
+
+    geometry = [tracker.locate(frame) for frame in frames]
+    valid = [position for position, found in enumerate(geometry) if found is not None]
+    mouths: list = [None] * len(frames)
+    if valid:
+        crops = [crop_for_model(frames[position], geometry[position][0]) for position in valid]
+        audio_indices = [min(first_index + position, len(audio_prompts) - 1) for position in valid]
+        padding = LIPSYNC_BATCH - len(crops)
+        crops += [crops[-1]] * padding
+        audio_indices += [audio_indices[-1]] * padding
+        generated = lipsync.generate(np.stack(crops), audio_prompts[audio_indices])
+        for mouth, position in zip(generated, valid):
+            mouths[position] = mouth
+    return list(zip(frames, mouths, geometry))
+
+
+def _blend_mouths(items) -> list[np.ndarray]:
+    """Parte de CPU: funde cada boca regenerada con su fotograma (recuperando la barba)."""
+    from lipsync import blend
+
+    result = []
+    for frame, mouth, geometry in items:
+        if mouth is None:
+            result.append(frame)
+        else:
+            box, mask, detail_mask = geometry
+            result.append(blend(frame, mouth, box, mask, detail_mask))
+    return result
+
+
+class _FrameWriter:
+    """Hilo que funde las bocas y envía los fotogramas a ffmpeg mientras la GPU sigue
+    renderizando el lote siguiente (la fusión y la escritura son CPU)."""
+
+    def __init__(self, encoder: subprocess.Popen):
+        self.encoder = encoder
+        self.queue: "queue.Queue" = queue.Queue(maxsize=2)
+        self.error: BaseException | None = None
+        self.thread = threading.Thread(target=self._run, name="frame-writer", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            if self.error is not None:
+                continue
+            try:
+                frames = _blend_mouths(item) if isinstance(item[0], tuple) else item
+                for frame in frames:
+                    self.encoder.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+            except BaseException as exc:  # se relanza en el hilo principal
+                self.error = exc
+
+    def put(self, item) -> None:
+        if self.error is not None:
+            raise self.error
+        self.queue.put(item)
+
+    def finish(self) -> None:
+        self.queue.put(None)
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
 
 
 def _resample_motion(motion: list[dict], source_fps: int, target_fps: int, frame_count: int) -> list[dict]:
@@ -333,6 +415,11 @@ class AvatarEngine:
         self.crop_cfg = CropConfig(device_id=device_id)
         self.cropper = MediaPipeCropper(self.crop_cfg, device_id=device_id)
         self.ffmpeg = find_ffmpeg()
+        self.lipsync = None
+        if MUSETALK_UNET.exists():
+            from lipsync import MuseTalkLipSync
+
+            self.lipsync = MuseTalkLipSync(self.wrapper.device, FACE_LANDMARKER_MODEL)
         self._lock = threading.Lock()
 
     @property
@@ -357,6 +444,9 @@ class AvatarEngine:
                 silence = Path(tmp) / "silence.wav"
                 soundfile.write(silence, np.zeros(16000, dtype=np.float32), 16000)
                 wrapper.gen_motion_sequence(_MotionArgs(audio=str(silence)))
+                if self.lipsync is not None:
+                    self.lipsync.audio_prompts(str(silence), 30, 30)
+                    self.lipsync.warmup(LIPSYNC_BATCH)
             torch.cuda.synchronize()
 
     def render(
@@ -427,6 +517,13 @@ class AvatarEngine:
         motion = _resample_motion(motion, MOTION_FPS, settings.fps, frame_count)
         check_cancelled()
 
+        use_musetalk = settings.lip_sync == "musetalk"
+        if use_musetalk and self.lipsync is None:
+            raise AvatarError("Faltan los modelos de MuseTalk: ejecuta npm run avatar:setup.")
+        audio_prompts = self.lipsync.audio_prompts(str(audio_path), settings.fps, frame_count) if use_musetalk else None
+        # Con MuseTalk los labios de LivePortrait se quedan en reposo: la boca se regenera después.
+        lip_scale = 0.0 if use_musetalk else settings.lip_scale
+
         # Referencia "neutra" del movimiento generado. JoyVASA usa el primer fotograma para todo;
         # aquí los labios siguen usándolo (el audio empieza con silencio: boca cerrada), pero ojos
         # y cejas se miden respecto a la expresión media de la secuencia. Si el primer fotograma
@@ -442,7 +539,11 @@ class AvatarEngine:
         def driving_keypoints(info: dict) -> torch.Tensor:
             R_new = (info["R"] @ R_d_0.permute(0, 2, 1)) @ R_s
             delta_new = x_s_info["exp"] + (info["exp"] - reference["exp"]) * settings.expression_scale
-            delta_new[:, LIP_EXP_INDICES, :] = info["exp"][:, LIP_EXP_INDICES, :]
+            # Labios: movimiento respecto a la boca de referencia (silencio inicial) × lip_scale.
+            reference_lips = reference["exp"][:, LIP_EXP_INDICES, :]
+            delta_new[:, LIP_EXP_INDICES, :] = reference_lips + (
+                info["exp"][:, LIP_EXP_INDICES, :] - reference_lips
+            ) * lip_scale
             scale_new = x_s_info["scale"] * (info["scale"] / reference["scale"])
             t_new = x_s_info["t"] + (info["t"] - reference["t"])
             t_new[..., 2] = 0
@@ -472,11 +573,22 @@ class AvatarEngine:
             stderr=subprocess.PIPE,
         )
 
+        tracker = self.lipsync.new_tracker() if use_musetalk else None
+        writer = _FrameWriter(encoder)
+        pending: list[np.ndarray] = []
+
+        def write_frames(frames: list[np.ndarray], first_index: int) -> None:
+            if tracker is not None:
+                writer.put(_generate_mouths(self.lipsync, tracker, frames, audio_prompts, first_index))
+            else:
+                writer.put(frames)
+
+        stage = "Renderizando el vídeo y sincronizando los labios" if use_musetalk else "Renderizando el vídeo"
         try:
             for index, frame_motion in enumerate(motion):
                 if index % 15 == 0:
                     check_cancelled()
-                    report("Renderizando el vídeo", 0.15 + 0.8 * index / frame_count)
+                    report(stage, 0.15 + 0.8 * index / frame_count)
                 x_d_i_new = driving_keypoints(dct2device(dict(frame_motion), device))
                 x_d_i_new = (x_d_i_new - x_d_ref_new) * motion_multiplier + x_s
 
@@ -486,8 +598,13 @@ class AvatarEngine:
                 x_d_i_new = x_s + (x_d_i_new - x_s) * cfg.driving_multiplier
 
                 out = wrapper.warp_decode(f_s, x_s, x_d_i_new)
-                frame = paste_back_gpu(out["out"])
-                encoder.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+                pending.append(paste_back_gpu(out["out"]))
+                if len(pending) == LIPSYNC_BATCH:
+                    write_frames(pending, index + 1 - len(pending))
+                    pending = []
+            if pending:
+                write_frames(pending, frame_count - len(pending))
+            writer.finish()
 
             report("Codificando el MP4", 0.96)
             encoder.stdin.close()
@@ -496,9 +613,15 @@ class AvatarEngine:
                 raise AvatarError(f"ffmpeg no pudo codificar el vídeo: {stderr.strip()[-400:]}")
         except BaseException:
             encoder.kill()
+            if writer.thread.is_alive():
+                writer.queue.put(None)
+                writer.thread.join(timeout=10)
             encoder.wait()
             output_path.unlink(missing_ok=True)
             raise
+        finally:
+            if tracker is not None:
+                tracker.close()
 
         report("Listo", 1.0)
         return RenderResult(output_path, width, height, settings.fps, frame_count, audio_duration)

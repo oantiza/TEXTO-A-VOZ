@@ -100,26 +100,27 @@ Para un plano medio (cabeza y pecho) en YouTube, usa una foto 16:9 de al menos 1
 
 Funciona con un segundo servidor, en Python, que usa la GPU del PC:
 
-- [JoyVASA](https://github.com/jdh-algo/JoyVASA) convierte el audio en movimiento facial y de cabeza, y [LivePortrait](https://github.com/KwaiVGI/LivePortrait) renderiza el vídeo. Ambos tienen licencia MIT.
-- La detección facial usa MediaPipe (Apache 2.0) en lugar de los modelos de InsightFace, que solo admiten uso no comercial. Así, toda la cadena es gratuita y admite uso comercial.
+- [JoyVASA](https://github.com/jdh-algo/JoyVASA) convierte el audio en movimiento de cabeza, ojos y parpadeo, y [LivePortrait](https://github.com/KwaiVGI/LivePortrait) lo renderiza. Ambos tienen licencia MIT.
+- [MuseTalk 1.5](https://github.com/TMElyralab/MuseTalk) regenera la boca a partir del audio. El código es MIT y los pesos son aptos para uso comercial. JoyVASA articula muy poco, así que la boca la mueve MuseTalk. La barba y la textura de la piel se recuperan del fotograma original, porque MuseTalk trabaja a 256 px y las pierde.
+- La detección facial y la máscara de la boca usan MediaPipe (Apache 2.0). No se usan InsightFace ni el modelo de segmentación de caras de MuseTalk, porque ambos son solo para uso no comercial. Así, toda la cadena es gratuita y admite uso comercial.
 - Cloud Run no tiene GPU. Allí la función se desactiva automáticamente (detecta `K_SERVICE`) y el resto de la app sigue igual.
 
 ### Instalación (una vez)
 
-Requisitos: Windows, GPU NVIDIA con driver reciente (probado con RTX 5070 Ti), Python 3.10 (`py -3.10`) y Git. Descarga unos 5 GB.
+Requisitos: Windows, GPU NVIDIA con driver reciente (probado con RTX 5070 Ti), Python 3.10 (`py -3.10`) y Git. Descarga unos 9 GB.
 
 ```powershell
 npm run avatar:setup
 ```
 
-El script crea `avatar-service\.venv`, instala PyTorch con CUDA 12.8 (necesario para las RTX 50xx), clona JoyVASA en una versión fija, descarga solo los pesos con licencia apta para uso comercial e instala ffmpeg si falta. Se puede repetir sin problema.
+El script crea `avatar-service\.venv`, instala PyTorch con CUDA 12.8 (necesario para las RTX 50xx), clona JoyVASA y MuseTalk en versiones fijas, descarga solo los pesos con licencia apta para uso comercial e instala ffmpeg si falta. Se puede repetir sin problema.
 
 Después coloca la imagen del presentador en `avatar-service\presenter\` (PNG/JPG/WEBP). Consulta [avatar-service/presenter/README.md](avatar-service/presenter/README.md) para ver cómo prepararla. Desde la app también se puede elegir otra imagen para la sesión con **Cambiar imagen**.
 
 ### Arranque en desarrollo (dos terminales)
 
 ```powershell
-# Terminal 1: servicio de vídeo (tarda ~40 s en cargar los modelos y calentar la GPU)
+# Terminal 1: servicio de vídeo (tarda ~1 min en cargar los modelos y calentar la GPU)
 npm run avatar
 ```
 
@@ -134,7 +135,8 @@ Abre [http://localhost:3000](http://localhost:3000). Si el servicio de vídeo no
 
 ```
 Navegador ──WAV──▶ Express /api/avatar ──▶ FastAPI 127.0.0.1:8765 (cola, 1 GPU)
-          ◀──MP4──                     ◀── JoyVASA + LivePortrait + ffmpeg
+          ◀──MP4──                     ◀── JoyVASA + LivePortrait (cabeza, ojos)
+                                            MuseTalk (boca) + ffmpeg
 ```
 
 - `POST /api/avatar` reenvía el WAV (y la imagen, si se ha cambiado) al servicio y devuelve un identificador de trabajo.
@@ -142,7 +144,7 @@ Navegador ──WAV──▶ Express /api/avatar ──▶ FastAPI 127.0.0.1:876
 - `GET /api/avatar/status` indica si la función está disponible y por qué no lo está.
 - Los trabajos se procesan de uno en uno y los MP4 se borran a las 24 horas (`avatar-service\jobs\`).
 
-Rendimiento medido con una RTX 5070 Ti: 9,3 s de audio a 1080p se generan en unos 13 s (≈1,4 veces la duración del audio). Por extrapolación, una locución de 3 minutos tardaría unos 4 minutos.
+Rendimiento medido con una RTX 5070 Ti a 1080p: 15,6 s de audio se generan en unos 39 s, unas 2,5 veces la duración del audio. Por extrapolación, una locución de 3 minutos tardaría unos 7–8 minutos.
 
 Prueba por línea de comandos, sin servidores:
 
@@ -160,6 +162,7 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 | `AVATAR_ENABLED` | `true` | `false` oculta la función también en local |
 | `AVATAR_MAX_AUDIO_SEC` | `1200` | Duración máxima del audio (servicio Python) |
 | `AVATAR_EXPRESSION_SCALE` | `0.6` | Intensidad de ojos y cejas (1 = JoyVASA original; los labios no cambian) |
+| `AVATAR_DETAIL_SIGMA` | `0.03` | Cuánta textura (barba, piel) se recupera del original en la zona regenerada por MuseTalk |
 | `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |
 
 **Uso responsable:** usa solo imágenes de personas que hayan dado su consentimiento. Si el vídeo se publica, indica que ha sido generado con IA; el Reglamento Europeo de IA lo exige para contenido sintético de personas.

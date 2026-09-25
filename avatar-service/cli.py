@@ -20,6 +20,9 @@ def main():
                         help="16:9 = YouTube 1920x1080, 9:16 = vertical 1080x1920, original = proporción de la imagen.")
     parser.add_argument("--max-dim", type=int, default=1920)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--lip-sync", default="musetalk", choices=["musetalk", "joyvasa"],
+                        help="Quién mueve la boca: MuseTalk (por defecto) o JoyVASA.")
+    parser.add_argument("--lip-scale", type=float, default=1.0, help="Amplificación de los labios (1 = JoyVASA original).")
     parser.add_argument("--expression-scale", type=float, default=0.6, help="Intensidad de ojos y cejas (1 = JoyVASA original).")
     parser.add_argument("--debug-crop", action="store_true", help="Guarda el recorte facial y los puntos detectados junto al vídeo.")
     args = parser.parse_args()
@@ -60,7 +63,8 @@ def main():
     result = engine.render(
         args.image, args.audio, args.out,
         RenderSettings(fps=args.fps, output_format=args.format, max_dim=args.max_dim,
-                       cfg_scale=args.cfg_scale, expression_scale=args.expression_scale),
+                       cfg_scale=args.cfg_scale, expression_scale=args.expression_scale,
+                       lip_sync=args.lip_sync, lip_scale=args.lip_scale),
         progress=progress,
     )
     elapsed = time.perf_counter() - started
