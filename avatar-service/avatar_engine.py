@@ -37,6 +37,9 @@ WEIGHTS_DIR = JOYVASA_DIR / "pretrained_weights"
 FACE_LANDMARKER_MODEL = WEIGHTS_DIR / "mediapipe" / "face_landmarker.task"
 MUSETALK_UNET = SERVICE_DIR / "MuseTalk" / "models" / "musetalkV15" / "unet.pth"
 LIPSYNC_BATCH = 16
+# "ditto": Ditto genera boca y pose y LivePortrait renderiza los labios a plena resolución.
+# "joyvasa": JoyVASA + MuseTalk (alternativa; la boca sale más blanda y tiembla más).
+MOTION_ENGINE = os.environ.get("AVATAR_MOTION_ENGINE", "ditto").strip().lower()
 
 if str(JOYVASA_DIR) not in sys.path:
     sys.path.insert(0, str(JOYVASA_DIR))
@@ -286,7 +289,15 @@ class RenderSettings:
     eye_smoothing: float = 1.0
     # "musetalk": la boca la regenera MuseTalk a partir del audio (LivePortrait deja los labios
     # quietos). "joyvasa": labios de JoyVASA, articulan poco; solo como alternativa.
-    lip_sync: str = "musetalk"
+    lip_sync: str = "musetalk" if MOTION_ENGINE == "joyvasa" else "none"
+    # Solo con Ditto: suavizado temporal de la pose (sigma en fotogramas a 25 fps) y semilla del
+    # muestreo por difusión (mismo audio + misma semilla = mismo vídeo).
+    # Medido (temblor en píxeles de la zona frente/gafas): 0,17 px sin filtro, 0,11 con 3, 0,07 con 6.
+    pose_smoothing: float = float(os.environ.get("AVATAR_POSE_SMOOTHING", "6.0"))
+    # Medido: la vibración de la anchura de la boca (>8 Hz) baja de 1,5 % a 1,0 % con 1,2 y el
+    # recorrido de los labios solo un 5 %; el filtro es simétrico, así que no retrasa la boca.
+    lip_smoothing: float = float(os.environ.get("AVATAR_LIP_SMOOTHING", "1.2"))
+    seed: int = 0
     # Elevación del labio superior (fracción de la apertura de la boca), solo con MuseTalk: este
     # mueve sobre todo mandíbula y labio inferior (medido: superior ~8,8 px de recorrido frente a
     # ~17 px del inferior; con 0,6 el superior pasa a ~11,9 px sin deformar el bigote).
@@ -436,6 +447,20 @@ class AvatarEngine:
     def __init__(self, device_id: int = 0, half_precision: bool = True):
         if not torch.cuda.is_available():
             raise AvatarError("PyTorch no detecta ninguna GPU CUDA.")
+        self.device_id = device_id
+        self.motion_engine = MOTION_ENGINE
+        self.crop_cfg = CropConfig(device_id=device_id)
+        self.cropper = MediaPipeCropper(self.crop_cfg, device_id=device_id)
+        self.ffmpeg = find_ffmpeg()
+        self._lock = threading.Lock()
+        self.wrapper = None
+        self.lipsync = None
+        self.ditto = None
+        if self.motion_engine == "ditto":
+            from ditto_motion import DittoMotion
+
+            self.ditto = DittoMotion(device="cuda")
+            return
         self.inference_cfg = InferenceConfig(
             device_id=device_id,
             flag_use_half_precision=half_precision,
@@ -450,19 +475,14 @@ class AvatarEngine:
         )
         with _motion_checkpoint_loadable():
             self.wrapper = LivePortraitWrapper(inference_cfg=self.inference_cfg)
-        self.crop_cfg = CropConfig(device_id=device_id)
-        self.cropper = MediaPipeCropper(self.crop_cfg, device_id=device_id)
-        self.ffmpeg = find_ffmpeg()
-        self.lipsync = None
         if MUSETALK_UNET.exists():
             from lipsync import MuseTalkLipSync
 
             self.lipsync = MuseTalkLipSync(self.wrapper.device, FACE_LANDMARKER_MODEL)
-        self._lock = threading.Lock()
 
     @property
     def device_name(self) -> str:
-        return torch.cuda.get_device_name(self.inference_cfg.device_id)
+        return torch.cuda.get_device_name(self.device_id)
 
     def warmup(self) -> None:
         """Primera pasada con datos sintéticos: cuDNN elige sus algoritmos (≈20 s) al arrancar
@@ -470,6 +490,11 @@ class AvatarEngine:
         import tempfile
 
         import soundfile
+
+        if self.ditto is not None:
+            with self._lock, torch.inference_mode():
+                self.ditto.warmup()
+            return
 
         wrapper = self.wrapper
         with self._lock, torch.inference_mode():
@@ -497,11 +522,118 @@ class AvatarEngine:
         cancel_event: threading.Event | None = None,
     ) -> RenderResult:
         # Una sola GPU: los trabajos se serializan.
+        renderer = self._render_ditto if self.ditto is not None else self._render
         with self._lock, torch.inference_mode():
-            return self._render(
+            return renderer(
                 Path(image_path), Path(audio_path), Path(output_path),
                 settings or RenderSettings(), progress or (lambda stage, fraction: None), cancel_event,
             )
+
+    def _prepare_image(self, image_path: Path, settings: "RenderSettings"):
+        """Carga, encuadra al formato pedido y localiza la cara. Devuelve (imagen RGB, 106 puntos)."""
+        img_rgb = load_image_rgb(str(image_path))
+        target_size = OUTPUT_FORMATS.get(settings.output_format)
+        if target_size is not None:
+            pt106 = self.cropper.detect_pt106(img_rgb)
+            if pt106 is None:
+                raise AvatarError("No se ha detectado ninguna cara en la imagen del presentador.")
+            img_rgb = reframe_to_format(img_rgb, pt106, *target_size)
+        else:
+            img_rgb = resize_to_limit(img_rgb, settings.max_dim, 2)
+        pt106 = self.cropper.detect_pt106(img_rgb)
+        if pt106 is None:
+            raise AvatarError("No se ha detectado ninguna cara en la imagen del presentador.")
+        return np.ascontiguousarray(img_rgb), pt106
+
+    def _start_encoder(self, width: int, height: int, fps: int, audio_path: Path, output_path: Path, crf: int):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return subprocess.Popen(
+            [
+                self.ffmpeg, "-y", "-loglevel", "error",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+                "-i", str(audio_path),
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
+                # Conversión y etiquetas BT.709 (ffmpeg usaría BT.601 por defecto): YouTube y los
+                # reproductores muestran los tonos de piel tal cual.
+                "-vf", "scale=out_color_matrix=bt709:out_range=tv,"
+                       "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+                "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                str(output_path),
+            ],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _render_ditto(self, image_path, audio_path, output_path, settings, report, cancel_event) -> RenderResult:
+        from ditto_motion import DittoMotion
+
+        def check_cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelled("Generación cancelada.")
+
+        ditto = self.ditto
+        report("Analizando la imagen", 0.0)
+        img_rgb, pt106 = self._prepare_image(image_path, settings)
+        height, width = img_rgb.shape[:2]
+        source_info = ditto.register(img_rgb, pt106)
+        M_c2o = source_info["M_c2o_lst"][0]
+        mask_ori = cv2.warpAffine(ditto.mask_crop, M_c2o[:2, :], dsize=(width, height), flags=cv2.INTER_LINEAR)
+        paste_back_gpu = GpuPasteBack(img_rgb, np.clip(mask_ori, 0, 1), M_c2o, 512, "cuda")
+        check_cancelled()
+
+        audio_duration = _probe_duration(audio_path)
+        if audio_duration <= 0.05:
+            raise AvatarError("El audio está vacío o es demasiado corto.")
+        frame_count = max(1, math.ceil(audio_duration * settings.fps))
+        report("Generando el movimiento a partir del audio", 0.05)
+        sequence = ditto.motion_sequence(
+            source_info, str(audio_path), seed=settings.seed,
+            progress=lambda fraction: report("Generando el movimiento a partir del audio", 0.05 + 0.1 * fraction),
+        )
+        sequence = DittoMotion.smooth(sequence, settings.pose_smoothing, settings.lip_smoothing)
+        sequence = DittoMotion.resample(sequence, settings.fps, frame_count)
+        driving = ditto.driving_frames(sequence)
+        ditto.setup_stitch(source_info, frame_count)
+        f_s = ditto.feature_tensor(source_info)
+        check_cancelled()
+
+        encoder = self._start_encoder(width, height, settings.fps, audio_path, output_path, settings.crf)
+        writer = _FrameWriter(encoder)
+        pending: list[np.ndarray] = []
+        try:
+            for index, x_d_info in enumerate(driving):
+                if index % 15 == 0:
+                    check_cancelled()
+                    report("Renderizando el vídeo", 0.15 + 0.8 * index / frame_count)
+                x_s, x_d = ditto.keypoints(source_info, x_d_info)
+                face = ditto.render(f_s, x_s.astype(np.float32), x_d.astype(np.float32))
+                pending.append(paste_back_gpu(face))
+                if len(pending) == LIPSYNC_BATCH:
+                    writer.put(pending)
+                    pending = []
+            if pending:
+                writer.put(pending)
+            writer.finish()
+
+            report("Codificando el MP4", 0.96)
+            encoder.stdin.close()
+            stderr = encoder.stderr.read().decode(errors="replace")
+            if encoder.wait() != 0:
+                raise AvatarError(f"ffmpeg no pudo codificar el vídeo: {stderr.strip()[-400:]}")
+        except BaseException:
+            encoder.kill()
+            if writer.thread.is_alive():
+                writer.queue.put(None)
+                writer.thread.join(timeout=10)
+            encoder.wait()
+            output_path.unlink(missing_ok=True)
+            raise
+
+        report("Listo", 1.0)
+        return RenderResult(output_path, width, height, settings.fps, frame_count, audio_duration)
 
     def _render(self, image_path, audio_path, output_path, settings, report, cancel_event) -> RenderResult:
         def check_cancelled():

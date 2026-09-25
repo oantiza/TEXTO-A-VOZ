@@ -100,27 +100,27 @@ Para un plano medio (cabeza y pecho) en YouTube, usa una foto 16:9 de al menos 1
 
 Funciona con un segundo servidor, en Python, que usa la GPU del PC:
 
-- [JoyVASA](https://github.com/jdh-algo/JoyVASA) convierte el audio en movimiento de cabeza, ojos y parpadeo, y [LivePortrait](https://github.com/KwaiVGI/LivePortrait) lo renderiza. Ambos tienen licencia MIT.
-- [MuseTalk 1.5](https://github.com/TMElyralab/MuseTalk) regenera la boca a partir del audio. El código es MIT y los pesos son aptos para uso comercial. JoyVASA articula muy poco, así que la boca la mueve MuseTalk. La barba y la textura de la piel se recuperan del fotograma original, porque MuseTalk trabaja a 256 px y las pierde.
-- La detección facial y la máscara de la boca usan MediaPipe (Apache 2.0). No se usan InsightFace ni el modelo de segmentación de caras de MuseTalk, porque ambos son solo para uso no comercial. Así, toda la cadena es gratuita y admite uso comercial.
+- [Ditto](https://github.com/antgroup/ditto-talkinghead) (Ant Group, Apache 2.0, código y pesos) convierte el audio en movimiento de boca y cabeza con un modelo de difusión condicionado por HuBERT, y [LivePortrait](https://github.com/KwaiVGI/LivePortrait) (MIT) renderiza la cara a plena resolución. Los labios salen nítidos, con dientes y con parpadeos naturales.
+- La detección facial usa MediaPipe (Apache 2.0). No se descargan los modelos de InsightFace que Ditto trae de serie, porque son solo para uso no comercial. Así, toda la cadena es gratuita y admite uso comercial.
+- Alternativa (`AVATAR_MOTION_ENGINE=joyvasa`): [JoyVASA](https://github.com/jdh-algo/JoyVASA) para cabeza y ojos con [MuseTalk 1.5](https://github.com/TMElyralab/MuseTalk) regenerando la boca (ambos MIT, pesos aptos para uso comercial). Se conserva por si hiciera falta, pero MuseTalk genera la boca a 256 px, más blanda y con algo de vibración.
 - Cloud Run no tiene GPU. Allí la función se desactiva automáticamente (detecta `K_SERVICE`) y el resto de la app sigue igual.
 
 ### Instalación (una vez)
 
-Requisitos: Windows, GPU NVIDIA con driver reciente (probado con RTX 5070 Ti), Python 3.10 (`py -3.10`) y Git. Descarga unos 9 GB.
+Requisitos: Windows, GPU NVIDIA con driver reciente (probado con RTX 5070 Ti), Python 3.10 (`py -3.10`) y Git. Descarga unos 11 GB.
 
 ```powershell
 npm run avatar:setup
 ```
 
-El script crea `avatar-service\.venv`, instala PyTorch con CUDA 12.8 (necesario para las RTX 50xx), clona JoyVASA y MuseTalk en versiones fijas, descarga solo los pesos con licencia apta para uso comercial e instala ffmpeg si falta. Se puede repetir sin problema.
+El script crea `avatar-service\.venv`, instala PyTorch con CUDA 12.8 (necesario para las RTX 50xx), clona Ditto, JoyVASA y MuseTalk en versiones fijas, descarga solo los pesos con licencia apta para uso comercial e instala ffmpeg si falta. Se puede repetir sin problema.
 
 Después coloca la imagen del presentador en `avatar-service\presenter\` (PNG/JPG/WEBP). Consulta [avatar-service/presenter/README.md](avatar-service/presenter/README.md) para ver cómo prepararla. Desde la app también se puede elegir otra imagen para la sesión con **Cambiar imagen**.
 
 ### Arranque en desarrollo (dos terminales)
 
 ```powershell
-# Terminal 1: servicio de vídeo (tarda ~1 min en cargar los modelos y calentar la GPU)
+# Terminal 1: servicio de vídeo (tarda ~30 s en cargar los modelos y calentar la GPU)
 npm run avatar
 ```
 
@@ -135,8 +135,7 @@ Abre [http://localhost:3000](http://localhost:3000). Si el servicio de vídeo no
 
 ```
 Navegador ──WAV──▶ Express /api/avatar ──▶ FastAPI 127.0.0.1:8765 (cola, 1 GPU)
-          ◀──MP4──                     ◀── JoyVASA + LivePortrait (cabeza, ojos)
-                                            MuseTalk (boca) + ffmpeg
+          ◀──MP4──                     ◀── Ditto (audio → movimiento) + LivePortrait + ffmpeg
 ```
 
 - `POST /api/avatar` reenvía el WAV (y la imagen, si se ha cambiado) al servicio y devuelve un identificador de trabajo.
@@ -144,7 +143,7 @@ Navegador ──WAV──▶ Express /api/avatar ──▶ FastAPI 127.0.0.1:876
 - `GET /api/avatar/status` indica si la función está disponible y por qué no lo está.
 - Los trabajos se procesan de uno en uno y los MP4 se borran a las 24 horas (`avatar-service\jobs\`).
 
-Rendimiento medido con una RTX 5070 Ti a 1080p: 15,6 s de audio se generan en unos 45 s, unas 2,9 veces la duración del audio. Por extrapolación, una locución de 3 minutos tardaría unos 9 minutos.
+Rendimiento medido con una RTX 5070 Ti a 1080p: 15,6 s de audio se generan en unos 31 s, unas 2 veces la duración del audio. Por extrapolación, una locución de 3 minutos tardaría unos 6 minutos. El servicio ocupa unos 7 GB de VRAM.
 
 Prueba por línea de comandos, sin servidores:
 
@@ -161,17 +160,20 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 | `AVATAR_SERVICE_TOKEN` | vacío | Secreto compartido entre Node y Python |
 | `AVATAR_ENABLED` | `true` | `false` oculta la función también en local |
 | `AVATAR_MAX_AUDIO_SEC` | `1200` | Duración máxima del audio (servicio Python) |
-| `AVATAR_EXPRESSION_SCALE` | `0.6` | Intensidad de ojos y cejas (1 = JoyVASA original; los labios no cambian) |
-| `AVATAR_DETAIL_SIGMA` | `0.03` | Cuánta textura (barba, piel) se recupera del original en la zona regenerada por MuseTalk |
-| `AVATAR_UPPER_LIP_LIFT` | `0.6` | Cuánto sube el labio superior al abrirse la boca (MuseTalk casi solo mueve el inferior; 0 = desactivado) |
-| `AVATAR_MOUTH_SHARPEN` | `1.2` | Enfoque de la boca generada por MuseTalk, que sale a 256 px (0 = sin enfoque) |
-| `AVATAR_MOUTH_SMOOTHING` | `0.5` | Media móvil de la boca de MuseTalk entre fotogramas (0 = sin suavizar); el audio se adelanta para compensar el retraso |
-| `AVATAR_BOX_SMOOTHING` | `0.2` | Suavizado del recuadro de la cara que se envía a MuseTalk (1 = sin suavizar) |
+| `AVATAR_MOTION_ENGINE` | `ditto` | Motor de movimiento: `ditto` o `joyvasa` (JoyVASA + MuseTalk) |
+| `AVATAR_POSE_SMOOTHING` | `6` | Suavizado temporal de la pose que genera Ditto (sigma en fotogramas a 25 fps; 0 = sin filtro) |
+| `AVATAR_LIP_SMOOTHING` | `1.2` | Suavizado ligero de los labios de Ditto (simétrico, no retrasa la boca; 0 = sin filtro) |
+| `AVATAR_EXPRESSION_SCALE` | `0.6` | Solo motor `joyvasa`: intensidad de ojos y cejas (1 = JoyVASA original) |
+| `AVATAR_DETAIL_SIGMA` | `0.03` | Solo motor `joyvasa`: textura (barba, piel) recuperada del original en la zona regenerada por MuseTalk |
+| `AVATAR_UPPER_LIP_LIFT` | `0.6` | Solo motor `joyvasa`: cuánto sube el labio superior al abrirse la boca (0 = desactivado) |
+| `AVATAR_MOUTH_SHARPEN` | `1.2` | Solo motor `joyvasa`: enfoque de la boca generada por MuseTalk (0 = sin enfoque) |
+| `AVATAR_MOUTH_SMOOTHING` | `0.5` | Solo motor `joyvasa`: media móvil de la boca de MuseTalk (0 = sin suavizar); el audio se adelanta para compensar el retraso |
+| `AVATAR_BOX_SMOOTHING` | `0.2` | Solo motor `joyvasa`: suavizado del recuadro de la cara que se envía a MuseTalk (1 = sin suavizar) |
 
-Dos estabilizaciones que conviene conocer:
+Estabilizaciones que conviene conocer:
 
-- La expresión que genera JoyVASA (cejas, mejillas, contorno) llega con ruido de un fotograma a otro, y sin filtrar la cabeza «tiembla». El motor la suaviza en el tiempo, con un filtro mucho más ligero en los párpados para no frenar los parpadeos. Medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,49 a 0,05 px de media.
-- MuseTalk genera cada fotograma por separado y los labios vibran. El motor interpola las características del audio a la posición exacta de cada fotograma (MuseTalk se entrenó a 25 fps y a 30 fps la ventana avanzaba a saltos) y aplica una media móvil en el espacio latente; como eso retrasa la boca, el audio se adelanta un fotograma para compensarlo. El temblor de los labios baja de 1,07 a 0,73 px y la boca queda 11 ms adelantada respecto a la voz, por debajo de lo perceptible.
+- Ditto genera la pose (giros y desplazamiento de la cabeza) con algo de ruido de un fotograma a otro. El motor la suaviza en el tiempo; medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,17 a 0,07 px de media. La boca y los parpadeos no pasan por ese filtro; los labios llevan uno mucho más ligero contra la vibración de las comisuras.
+- Con el motor `joyvasa`, la expresión de JoyVASA se suaviza (temblor de 0,49 a 0,05 px) y la boca de MuseTalk se estabiliza con una media móvil en el espacio latente, adelantando el audio un fotograma para compensar el retraso.
 | `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |
 
 **Uso responsable:** usa solo imágenes de personas que hayan dado su consentimiento. Si el vídeo se publica, indica que ha sido generado con IA; el Reglamento Europeo de IA lo exige para contenido sintético de personas.

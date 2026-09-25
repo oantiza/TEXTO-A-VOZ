@@ -287,6 +287,7 @@ def health():
         "status": engine_state.status,
         "error": engine_state.error or None,
         "device": engine_state.device or None,
+        "engine": getattr(engine_state.engine, "motion_engine", None),
         "defaultPresenter": presenter is not None,
         "queued": sum(1 for job in jobs.values() if job.status == "queued"),
         "running": any(job.status == "running" for job in jobs.values()),

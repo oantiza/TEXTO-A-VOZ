@@ -11,6 +11,7 @@ coverage/
 avatar-service/.venv/
 avatar-service/JoyVASA/
 avatar-service/MuseTalk/
+avatar-service/ditto/
 avatar-service/jobs/
 avatar-service/test-output/
 avatar-service/presenter/*

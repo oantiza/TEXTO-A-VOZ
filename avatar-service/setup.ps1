@@ -8,6 +8,8 @@ $JoyVasaDir = Join-Path $ServiceDir 'JoyVASA'
 $JoyVasaCommit = '916a90f8de490e8648fee460c1200bd5d9a795af'
 $MuseTalkDir = Join-Path $ServiceDir 'MuseTalk'
 $MuseTalkCommit = '0a89dec45a0192b824e3cf4daf96c239440c5ed8'
+$DittoDir = Join-Path $ServiceDir 'ditto'
+$DittoCommit = 'c3e47eee2e626500017a0556b470d6d4182f85e8'
 $Weights = Join-Path $JoyVasaDir 'pretrained_weights'
 $Python = Join-Path $ServiceDir '.venv\Scripts\python.exe'
 $env:HF_HUB_DISABLE_PROGRESS_BARS = '1'
@@ -52,6 +54,13 @@ if (-not (Test-Path $MuseTalkDir)) {
 Run git -C $MuseTalkDir fetch --quiet origin
 Run git -C $MuseTalkDir -c advice.detachedHead=false checkout --quiet $MuseTalkCommit
 
+Step "Clonando Ditto ($($DittoCommit.Substring(0, 7)))"
+if (-not (Test-Path $DittoDir)) {
+    Run git clone https://github.com/antgroup/ditto-talkinghead.git $DittoDir
+}
+Run git -C $DittoDir fetch --quiet origin
+Run git -C $DittoDir -c advice.detachedHead=false checkout --quiet $DittoCommit
+
 Step 'Creando el entorno virtual (.venv, Python 3.10)'
 if (-not (Test-Path $Python)) { Run py -3.10 -m venv (Join-Path $ServiceDir '.venv') }
 Run $Python -m pip install --quiet --upgrade pip wheel "setuptools<81"
@@ -88,6 +97,15 @@ m = r'$MuseTalkModels'
 snapshot_download('TMElyralab/MuseTalk', local_dir=m, allow_patterns=['musetalkV15/*'])
 snapshot_download('stabilityai/sd-vae-ft-mse', local_dir=m + r'\sd-vae', allow_patterns=['config.json', 'diffusion_pytorch_model.safetensors'])
 snapshot_download('openai/whisper-tiny', local_dir=m + r'\whisper', allow_patterns=['config.json', 'model.safetensors', 'preprocessor_config.json'])
+"@
+# - Ditto (Apache 2.0, código y pesos): LMDM, HuBERT en ONNX y el renderizador LivePortrait. No se
+#   descargan det_10g ni 2d106det (InsightFace): la cara se localiza con MediaPipe.
+$DittoCheckpoints = Join-Path $DittoDir 'checkpoints'
+Run $Python -c @"
+from huggingface_hub import snapshot_download
+snapshot_download('digital-avatar/ditto-talkinghead', local_dir=r'$DittoCheckpoints', allow_patterns=[
+    'ditto_cfg/v0.4_hubert_cfg_pytorch.pkl', 'ditto_pytorch/models/*', 'ditto_pytorch/aux_models/face_landmarker.task',
+    'ditto_pytorch/aux_models/hubert_streaming_fix_kv.onnx', 'ditto_pytorch/aux_models/landmark203.onnx', 'LICENSE'])
 "@
 $Landmarker = Join-Path $Weights 'mediapipe\face_landmarker.task'
 if (-not (Test-Path $Landmarker)) {

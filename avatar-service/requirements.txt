@@ -28,7 +28,10 @@ requests==2.34.2
 pillow==12.3.0
 huggingface_hub==0.36.2
 
-# Lip-sync MuseTalk 1.5 (UNet + VAE de diffusers)
+# Ditto (movimiento a partir del audio)
+filetype==1.2.0
+
+# Lip-sync MuseTalk 1.5 (UNet + VAE de diffusers), alternativa
 diffusers==0.30.2
 einops==0.8.1
 accelerate==1.10.1
