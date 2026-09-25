@@ -297,6 +297,8 @@ class RenderSettings:
     # Medido: la vibración de la anchura de la boca (>8 Hz) baja de 1,5 % a 1,0 % con 1,2 y el
     # recorrido de los labios solo un 5 %; el filtro es simétrico, así que no retrasa la boca.
     lip_smoothing: float = float(os.environ.get("AVATAR_LIP_SMOOTHING", "1.2"))
+    # Adelanto del movimiento respecto al audio, en ms (Ditto entrega la boca con retraso).
+    audio_lead_ms: float = float(os.environ.get("AVATAR_AUDIO_LEAD_MS", "120"))
     seed: int = 0
     # Elevación del labio superior (fracción de la apertura de la boca), solo con MuseTalk: este
     # mueve sobre todo mandíbula y labio inferior (medido: superior ~8,8 px de recorrido frente a
@@ -594,7 +596,7 @@ class AvatarEngine:
             progress=lambda fraction: report("Generando el movimiento a partir del audio", 0.05 + 0.1 * fraction),
         )
         sequence = DittoMotion.smooth(sequence, settings.pose_smoothing, settings.lip_smoothing)
-        sequence = DittoMotion.resample(sequence, settings.fps, frame_count)
+        sequence = DittoMotion.resample(sequence, settings.fps, frame_count, settings.audio_lead_ms)
         driving = ditto.driving_frames(sequence)
         ditto.setup_stitch(source_info, frame_count)
         f_s = ditto.feature_tensor(source_info)

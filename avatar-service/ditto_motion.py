@@ -170,10 +170,16 @@ class DittoMotion:
         return result
 
     @staticmethod
-    def resample(sequence: np.ndarray, target_fps: int, frame_count: int) -> np.ndarray:
-        """Interpola la secuencia de 25 fps a la cadencia de salida."""
+    def resample(sequence: np.ndarray, target_fps: int, frame_count: int, lead_ms: float = 0.0) -> np.ndarray:
+        """Interpola la secuencia de 25 fps a la cadencia de salida, adelantándola `lead_ms`.
+
+        La boca que genera Ditto llega unos 100-130 ms tarde respecto a la voz (medido contra
+        MuseTalk, entrenado con pérdida de sincronía); el adelanto lo compensa con precisión de
+        subfotograma. El primer tramo del movimiento se descarta y el final se mantiene.
+        """
         last = len(sequence) - 1
-        positions = np.minimum(np.arange(frame_count) * MOTION_FPS / target_fps, last)
+        times = np.arange(frame_count) / target_fps + lead_ms / 1000.0
+        positions = np.clip(times * MOTION_FPS, 0, last)
         low = np.floor(positions).astype(int)
         high = np.minimum(low + 1, last)
         weight = (positions - low)[:, None].astype(np.float32)
