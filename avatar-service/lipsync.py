@@ -32,6 +32,7 @@ CROP_SIZE = 256
 AUDIO_FPS = 50  # fotogramas de características de Whisper por segundo
 AUDIO_PADDING = 2  # contexto de audio a cada lado (igual que MuseTalk)
 AUDIO_WINDOW = 2 * (2 * AUDIO_PADDING + 1)
+AUDIO_INTERPOLATE = True
 
 # Puntos de MediaPipe usados (malla de 478).
 JAW = [127, 234, 93, 132, 58, 172, 136, 150, 149, 176, 148, 152,
@@ -41,7 +42,27 @@ SUBNASALE = 2  # base de la nariz: límite superior de la zona que se regenera
 # Radio (relativo al ancho del recuadro) que separa "forma" (MuseTalk) de "textura" (original):
 # mayor = más densidad y tono de barba recuperados.
 DETAIL_SIGMA = float(os.environ.get("AVATAR_DETAIL_SIGMA", "0.03"))
-MOUTH_SHARPEN = float(os.environ.get("AVATAR_MOUTH_SHARPEN", "0.0"))
+# MuseTalk genera la boca a 256 px: una máscara de enfoque de radio fino (≈1,5 px) la iguala al
+# resto de la cara. Medido: nitidez de los labios 27,6 -> 33,0 (LivePortrait solo: 42,8), sin halos.
+MOUTH_SHARPEN = float(os.environ.get("AVATAR_MOUTH_SHARPEN", "1.2"))
+# Suavizado temporal: peso del fotograma anterior en el recuadro de la cara (puntos de MediaPipe
+# con media móvil; 1 - alpha) y en los latentes de MuseTalk (0 = sin suavizar).
+BOX_SMOOTHING = float(os.environ.get("AVATAR_BOX_SMOOTHING", "0.2"))
+# Medido con 0,5: temblor de labios 1,07 -> 0,73 px; retraso real 0,64 fotogramas, que el
+# adelanto del audio (audio_lead_frames) convierte en 0,34 fotogramas de antelación (11 ms,
+# imperceptible; una boca adelantada molesta mucho menos que una retrasada). Con 0,65 tiembla
+# algo menos (0,66 px) pero los cierres rápidos (p, b, m) quedan incompletos.
+MOUTH_SMOOTHING = float(os.environ.get("AVATAR_MOUTH_SMOOTHING", "0.5"))
+LIFT_SMOOTHING = 0.4
+MOUTH_SHARPEN_RADIUS = 0.004  # sigma del enfoque (× ancho del recuadro): ≈1,5 px en 1080p
+
+
+def audio_lead_frames() -> int:
+    """Fotogramas que hay que adelantar el audio para compensar el retraso medio de la media
+    móvil de latentes (k/(1-k) fotogramas): así la boca no va por detrás de la voz."""
+    if MOUTH_SMOOTHING <= 0:
+        return 0
+    return int(round(MOUTH_SMOOTHING / (1.0 - MOUTH_SMOOTHING)))
 MOUTH_TOP_OFFSET = -0.04  # desplazamiento del límite superior de la boca (× ancho de labios, + = abajo)
 MOUTH_FEATHER = 0.25  # difuminado del borde de la boca (× ancho de labios)
 # Puntos de los labios para el elevador del labio superior (UpperLipLifter).
@@ -98,6 +119,11 @@ class MuseTalkLipSync:
         self.whisper = WhisperModel.from_pretrained(MUSETALK_MODELS / "whisper", torch_dtype=dtype).to(device).eval()
         self.landmarker_model = landmarker_model
         self._timestamp_ms = 0
+        self._latent_state = None
+
+    def reset(self) -> None:
+        """Olvida el estado temporal (llamar al empezar cada vídeo)."""
+        self._latent_state = None
 
     # ---------------------------------------------------------------- audio
     @torch.inference_mode()
@@ -119,16 +145,25 @@ class MuseTalkLipSync:
             features,
             torch.zeros_like(features[:, : pad * 3 * AUDIO_PADDING]),
         ], dim=1)
-        last_start = features.shape[1] - AUDIO_WINDOW
-        prompts = [
-            features[:, min(math.floor(index * step), last_start): min(math.floor(index * step), last_start) + AUDIO_WINDOW]
-            for index in range(frame_count)
-        ]
+        # MuseTalk se entrenó a 25 fps (2 características de audio por fotograma). A 30 fps el
+        # paso es 1,67: si se trunca, la ventana avanza 1 y 2 alternando y la boca vibra. Se
+        # interpola linealmente en la posición fraccionaria (a 25 fps es idéntico al original).
+        last_start = features.shape[1] - AUDIO_WINDOW - 1
+        prompts = []
+        for index in range(frame_count):
+            position = min(index * step, last_start)
+            start = math.floor(position)
+            fraction = position - start
+            window = features[:, start: start + AUDIO_WINDOW]
+            if AUDIO_INTERPOLATE and fraction > 1e-6:
+                window = (1 - fraction) * window + fraction * features[:, start + 1: start + 1 + AUDIO_WINDOW]
+            prompts.append(window)
         prompts = torch.cat(prompts, dim=0)  # [T, 10, 5, 384]
         return prompts.reshape(prompts.shape[0], -1, prompts.shape[-1])  # [T, 50, 384]
 
     # ---------------------------------------------------------------- geometría
     def new_tracker(self) -> "_FaceTracker":
+        self.reset()
         return _FaceTracker(self)
 
     def _create_landmarker(self):
@@ -163,6 +198,17 @@ class MuseTalkLipSync:
         audio_features = self.pe(audio.to(self.dtype))
         timesteps = torch.zeros(1, device=self.device)
         predicted = self.unet(latents, timesteps, encoder_hidden_states=audio_features).sample
+        if MOUTH_SMOOTHING > 0:
+            # MuseTalk genera cada fotograma por separado y la boca vibra. Media móvil en el
+            # espacio latente (retraso ≈ 1 fotograma con 0,5): forma intermedia, sin dobles labios.
+            state = self._latent_state
+            smoothed = torch.empty_like(predicted)
+            for index in range(predicted.shape[0]):
+                state = predicted[index] if state is None else MOUTH_SMOOTHING * state + (1 - MOUTH_SMOOTHING) * predicted[index]
+                smoothed[index] = state
+            self._latent_state = state
+            predicted = smoothed
+        # (Decodificar un latente ampliado ×1.5 se probó y deshace la forma de los labios.)
         images = self.vae.decode(predicted / scaling).sample
         images = ((images.float() / 2 + 0.5).clamp(0, 1) * 255).round().to(torch.uint8)
         return images.permute(0, 2, 3, 1).cpu().numpy()
@@ -179,7 +225,7 @@ class _FaceTracker:
     def __init__(self, lipsync: MuseTalkLipSync):
         self.lipsync = lipsync
         self.landmarker = lipsync._create_landmarker()
-        self.points = _Smoother(alpha=0.6)
+        self.points = _Smoother(alpha=BOX_SMOOTHING)
         self.last = None
 
     def close(self) -> None:
@@ -272,7 +318,7 @@ class UpperLipLifter:
         )
         self.landmarker = vision.FaceLandmarker.create_from_options(options)
         self.amount = amount
-        self.lift = _Smoother(alpha=0.6)
+        self.lift = _Smoother(alpha=LIFT_SMOOTHING)
 
     def close(self) -> None:
         self.landmarker.close()
@@ -312,11 +358,17 @@ class UpperLipLifter:
         weight_x = 0.5 + 0.5 * np.cos(np.pi * np.clip((xs - center_x) / half, -1, 1))
         # Se muestrea de más abajo: el contenido sube. Desplazamiento solo vertical, interpolado a
         # mano (cv2.remap de OpenCV 5.0 tarda ~0,7 s incluso en recortes pequeños).
-        source_y = np.clip(ys + lift * weight_x * weight_y, 0, height - 1.001)
+        source_y = np.clip(ys + lift * weight_x * weight_y, 1, height - 2.001)
         row = np.floor(source_y).astype(np.int32)
-        frac = (source_y - row)[..., None]
+        f = (source_y - row)[..., None]
         columns = xs.astype(np.int32)
-        warped = (1 - frac) * frame[row, columns] + frac * frame[row + 1, columns]
+        # Interpolación cúbica (Catmull-Rom): la bilineal emborronaba el borde de los labios.
+        w0 = ((-0.5 * f + 1.0) * f - 0.5) * f
+        w1 = (1.5 * f - 2.5) * f * f + 1.0
+        w2 = ((-1.5 * f + 2.0) * f + 0.5) * f
+        w3 = (0.5 * f - 0.5) * f * f
+        warped = (w0 * frame[row - 1, columns] + w1 * frame[row, columns]
+                  + w2 * frame[row + 1, columns] + w3 * frame[row + 2, columns])
         out = frame.copy()
         out[y0:y1, x0:x1] = np.clip(warped + 0.5, 0, 255).astype(np.uint8)
         return out
@@ -337,7 +389,7 @@ def blend(frame: np.ndarray, generated: np.ndarray, box, mask: np.ndarray, detai
     detail = region - cv2.GaussianBlur(region, (0, 0), sigma)
     patch_low = cv2.GaussianBlur(patch, (0, 0), sigma)
     # En la boca (solo MuseTalk) se enfoca un poco: sale de 256 px y se ve blanda junto al resto.
-    sharpen_sigma = max(1.0, 0.008 * (x2 - x1))
+    sharpen_sigma = max(0.8, MOUTH_SHARPEN_RADIUS * (x2 - x1))
     sharpened = patch + MOUTH_SHARPEN * (patch - cv2.GaussianBlur(patch, (0, 0), sharpen_sigma))
     restored = sharpened + detail_mask * (patch_low + detail - sharpened)
     out = frame.copy()

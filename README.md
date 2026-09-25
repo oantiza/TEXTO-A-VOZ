@@ -144,7 +144,7 @@ Navegador ──WAV──▶ Express /api/avatar ──▶ FastAPI 127.0.0.1:876
 - `GET /api/avatar/status` indica si la función está disponible y por qué no lo está.
 - Los trabajos se procesan de uno en uno y los MP4 se borran a las 24 horas (`avatar-service\jobs\`).
 
-Rendimiento medido con una RTX 5070 Ti a 1080p: 15,6 s de audio se generan en unos 39 s, unas 2,5 veces la duración del audio. Por extrapolación, una locución de 3 minutos tardaría unos 7–8 minutos.
+Rendimiento medido con una RTX 5070 Ti a 1080p: 15,6 s de audio se generan en unos 45 s, unas 2,9 veces la duración del audio. Por extrapolación, una locución de 3 minutos tardaría unos 9 minutos.
 
 Prueba por línea de comandos, sin servidores:
 
@@ -164,9 +164,14 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 | `AVATAR_EXPRESSION_SCALE` | `0.6` | Intensidad de ojos y cejas (1 = JoyVASA original; los labios no cambian) |
 | `AVATAR_DETAIL_SIGMA` | `0.03` | Cuánta textura (barba, piel) se recupera del original en la zona regenerada por MuseTalk |
 | `AVATAR_UPPER_LIP_LIFT` | `0.6` | Cuánto sube el labio superior al abrirse la boca (MuseTalk casi solo mueve el inferior; 0 = desactivado) |
-| `AVATAR_MOUTH_SHARPEN` | `0` | Enfoque opcional de la boca generada por MuseTalk |
+| `AVATAR_MOUTH_SHARPEN` | `1.2` | Enfoque de la boca generada por MuseTalk, que sale a 256 px (0 = sin enfoque) |
+| `AVATAR_MOUTH_SMOOTHING` | `0.5` | Media móvil de la boca de MuseTalk entre fotogramas (0 = sin suavizar); el audio se adelanta para compensar el retraso |
+| `AVATAR_BOX_SMOOTHING` | `0.2` | Suavizado del recuadro de la cara que se envía a MuseTalk (1 = sin suavizar) |
 
-La expresión que genera JoyVASA (cejas, mejillas, contorno) llega con ruido de un fotograma a otro, y sin filtrar la cabeza «tiembla». El motor la suaviza en el tiempo, con un filtro mucho más ligero en los párpados para no frenar los parpadeos. Medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,49 a 0,05 px de media.
+Dos estabilizaciones que conviene conocer:
+
+- La expresión que genera JoyVASA (cejas, mejillas, contorno) llega con ruido de un fotograma a otro, y sin filtrar la cabeza «tiembla». El motor la suaviza en el tiempo, con un filtro mucho más ligero en los párpados para no frenar los parpadeos. Medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,49 a 0,05 px de media.
+- MuseTalk genera cada fotograma por separado y los labios vibran. El motor interpola las características del audio a la posición exacta de cada fotograma (MuseTalk se entrenó a 25 fps y a 30 fps la ventana avanzaba a saltos) y aplica una media móvil en el espacio latente; como eso retrasa la boca, el audio se adelanta un fotograma para compensarlo. El temblor de los labios baja de 1,07 a 0,73 px y la boca queda 11 ms adelantada respecto a la voz, por debajo de lo perceptible.
 | `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |
 
 **Uso responsable:** usa solo imágenes de personas que hayan dado su consentimiento. Si el vídeo se publica, indica que ha sido generado con IA; el Reglamento Europeo de IA lo exige para contenido sintético de personas.

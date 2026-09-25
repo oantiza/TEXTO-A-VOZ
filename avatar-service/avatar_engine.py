@@ -312,14 +312,15 @@ def _generate_mouths(lipsync, tracker, frames: list[np.ndarray], audio_prompts: 
     Devuelve [(fotograma, boca, geometría)] para fundir después (en otro hilo). El lote se rellena
     siempre hasta LIPSYNC_BATCH: cada tamaño nuevo obliga a cuDNN a recalibrar (segundos).
     """
-    from lipsync import crop_for_model
+    from lipsync import audio_lead_frames, crop_for_model
 
     geometry = [tracker.locate(frame) for frame in frames]
     valid = [position for position, found in enumerate(geometry) if found is not None]
     mouths: list = [None] * len(frames)
     if valid:
         crops = [crop_for_model(frames[position], geometry[position][0]) for position in valid]
-        audio_indices = [min(first_index + position, len(audio_prompts) - 1) for position in valid]
+        lead = audio_lead_frames()
+        audio_indices = [min(first_index + position + lead, len(audio_prompts) - 1) for position in valid]
         padding = LIPSYNC_BATCH - len(crops)
         crops += [crops[-1]] * padding
         audio_indices += [audio_indices[-1]] * padding
