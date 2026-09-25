@@ -41,6 +41,9 @@ SUBNASALE = 2  # base de la nariz: límite superior de la zona que se regenera
 # Radio (relativo al ancho del recuadro) que separa "forma" (MuseTalk) de "textura" (original):
 # mayor = más densidad y tono de barba recuperados.
 DETAIL_SIGMA = float(os.environ.get("AVATAR_DETAIL_SIGMA", "0.03"))
+MOUTH_SHARPEN = float(os.environ.get("AVATAR_MOUTH_SHARPEN", "0.6"))
+MOUTH_TOP_OFFSET = -0.02  # desplazamiento del límite superior de la boca (× ancho de labios, + = abajo)
+MOUTH_FEATHER = 0.10  # difuminado del borde de la boca (× ancho de labios)
 OUTER_LIPS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
 
 
@@ -232,10 +235,12 @@ def _mouth_geometry(points: np.ndarray, width: int, height: int):
     mouth[:, 0] = lips_center[0] + (mouth[:, 0] - lips_center[0]) * 1.12
     below = mouth[:, 1] > lips_center[1]
     mouth[below, 1] += 0.45 * lips_width  # espacio para que la mandíbula baje al hablar
-    mouth[~below, 1] -= 0.04 * lips_width
+    # Arriba el límite va pegado al borde del labio superior: si sube, el difuminado borra el
+    # bigote; si baja, se cuela el contorno del labio original (doble línea).
+    mouth[~below, 1] += MOUTH_TOP_OFFSET * lips_width
     mouth_mask = np.zeros((box_h, box_w), dtype=np.float32)
     cv2.fillPoly(mouth_mask, [np.round(cv2.convexHull(mouth) - [x1, y1]).astype(np.int32)], 1.0)
-    mouth_blur = int(0.25 * lips_width) | 1
+    mouth_blur = int(MOUTH_FEATHER * lips_width) | 1
     mouth_mask = cv2.GaussianBlur(mouth_mask, (mouth_blur, mouth_blur), 0)
     detail_mask = 1.0 - mouth_mask
     return (x1, y1, x2, y2), mask[..., None], detail_mask[..., None]
@@ -255,7 +260,10 @@ def blend(frame: np.ndarray, generated: np.ndarray, box, mask: np.ndarray, detai
     sigma = max(1.5, DETAIL_SIGMA * (x2 - x1))
     detail = region - cv2.GaussianBlur(region, (0, 0), sigma)
     patch_low = cv2.GaussianBlur(patch, (0, 0), sigma)
-    restored = patch + detail_mask * (patch_low + detail - patch)
+    # En la boca (solo MuseTalk) se enfoca un poco: sale de 256 px y se ve blanda junto al resto.
+    sharpen_sigma = max(1.0, 0.008 * (x2 - x1))
+    sharpened = patch + MOUTH_SHARPEN * (patch - cv2.GaussianBlur(patch, (0, 0), sharpen_sigma))
+    restored = sharpened + detail_mask * (patch_low + detail - sharpened)
     out = frame.copy()
     out[y1:y2, x1:x2] = np.clip(mask * restored + (1 - mask) * region, 0, 255).astype(np.uint8)
     return out

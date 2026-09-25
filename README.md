@@ -163,6 +163,7 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 | `AVATAR_MAX_AUDIO_SEC` | `1200` | Duración máxima del audio (servicio Python) |
 | `AVATAR_EXPRESSION_SCALE` | `0.6` | Intensidad de ojos y cejas (1 = JoyVASA original; los labios no cambian) |
 | `AVATAR_DETAIL_SIGMA` | `0.03` | Cuánta textura (barba, piel) se recupera del original en la zona regenerada por MuseTalk |
+| `AVATAR_MOUTH_SHARPEN` | `0.6` | Enfoque de la boca generada por MuseTalk (0 = sin enfoque) |
 | `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |
 
 **Uso responsable:** usa solo imágenes de personas que hayan dado su consentimiento. Si el vídeo se publica, indica que ha sido generado con IA; el Reglamento Europeo de IA lo exige para contenido sintético de personas.
