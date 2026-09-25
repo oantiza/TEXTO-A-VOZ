@@ -170,6 +170,17 @@ class DittoMotion:
         return result
 
     @staticmethod
+    def scale_lips(sequence: np.ndarray, factor: float) -> np.ndarray:
+        """Amplifica el movimiento de los labios respecto al primer fotograma (la boca en reposo,
+        que es la referencia del modo relativo de Ditto)."""
+        if factor == 1.0:
+            return sequence
+        result = sequence.copy()
+        rest = sequence[:1, LIP_DIMS]
+        result[:, LIP_DIMS] = rest + (sequence[:, LIP_DIMS] - rest) * factor
+        return result
+
+    @staticmethod
     def resample(sequence: np.ndarray, target_fps: int, frame_count: int, lead_ms: float = 0.0) -> np.ndarray:
         """Interpola la secuencia de 25 fps a la cadencia de salida, adelantándola `lead_ms`.
 

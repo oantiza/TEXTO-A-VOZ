@@ -162,8 +162,10 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 | `AVATAR_MAX_AUDIO_SEC` | `1200` | Duración máxima del audio (servicio Python) |
 | `AVATAR_MOTION_ENGINE` | `ditto` | Motor de movimiento: `ditto` o `joyvasa` (JoyVASA + MuseTalk) |
 | `AVATAR_POSE_SMOOTHING` | `6` | Suavizado temporal de la pose que genera Ditto (sigma en fotogramas a 25 fps; 0 = sin filtro) |
-| `AVATAR_LIP_SMOOTHING` | `1.2` | Suavizado ligero de los labios de Ditto (simétrico, no retrasa la boca; 0 = sin filtro) |
 | `AVATAR_AUDIO_LEAD_MS` | `120` | Adelanto del movimiento de Ditto respecto a la voz, en ms (súbelo si la boca va tarde; bájalo si se adelanta) |
+| `AVATAR_GUIDANCE` | `3` | Cuánto obedece al audio el modelo de movimiento de Ditto (Ditto usa 2; más = boca más marcada) |
+| `AVATAR_LIP_SCALE` | `1` | Amplificación del movimiento de los labios respecto a la boca en reposo |
+| `AVATAR_LIP_SMOOTHING` | `0` | Suavizado temporal de los labios de Ditto. Desactivado: cualquier valor apreciable borra la articulación por sílabas |
 | `AVATAR_EXPRESSION_SCALE` | `0.6` | Solo motor `joyvasa`: intensidad de ojos y cejas (1 = JoyVASA original) |
 | `AVATAR_DETAIL_SIGMA` | `0.03` | Solo motor `joyvasa`: textura (barba, piel) recuperada del original en la zona regenerada por MuseTalk |
 | `AVATAR_UPPER_LIP_LIFT` | `0.6` | Solo motor `joyvasa`: cuánto sube el labio superior al abrirse la boca (0 = desactivado) |
@@ -173,7 +175,7 @@ Variables opcionales (en `.env`, las lee tanto Node como el servicio Python):
 
 Estabilizaciones que conviene conocer:
 
-- Ditto genera la pose (giros y desplazamiento de la cabeza) con algo de ruido de un fotograma a otro. El motor la suaviza en el tiempo; medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,17 a 0,07 px de media. La boca y los parpadeos no pasan por ese filtro; los labios llevan uno mucho más ligero contra la vibración de las comisuras.
+- Ditto genera la pose (giros y desplazamiento de la cabeza) con algo de ruido de un fotograma a otro. El motor la suaviza en el tiempo; medido en píxeles sobre la zona de la frente y las gafas, el temblor baja de 0,17 a 0,07 px de media. La boca y los parpadeos no pasan por ese filtro: suavizar los labios, aunque sea poco, elimina la modulación por sílabas (medida como la energía de la apertura de la boca entre 3 y 8 Hz: 16 % sin filtro, 5 % con un filtro de 1,2 fotogramas).
 - La boca de Ditto llega unos 100–130 ms tarde respecto a la voz (medido comparando la apertura de la boca con la de MuseTalk, que se entrena con una pérdida de sincronía). El motor adelanta el movimiento 120 ms al remuestrear, con precisión de subfotograma; con eso el desfase medido queda en 0 ms.
 - Con el motor `joyvasa`, la expresión de JoyVASA se suaviza (temblor de 0,49 a 0,05 px) y la boca de MuseTalk se estabiliza con una media móvil en el espacio latente, adelantando el audio un fotograma para compensar el retraso.
 | `AVATAR_DEFAULT_IMAGE` | primera imagen de `presenter\` | Ruta alternativa de la imagen |

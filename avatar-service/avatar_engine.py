@@ -294,18 +294,21 @@ class RenderSettings:
     # muestreo por difusión (mismo audio + misma semilla = mismo vídeo).
     # Medido (temblor en píxeles de la zona frente/gafas): 0,17 px sin filtro, 0,11 con 3, 0,07 con 6.
     pose_smoothing: float = float(os.environ.get("AVATAR_POSE_SMOOTHING", "6.0"))
-    # Medido: la vibración de la anchura de la boca (>8 Hz) baja de 1,5 % a 1,0 % con 1,2 y el
-    # recorrido de los labios solo un 5 %; el filtro es simétrico, así que no retrasa la boca.
-    lip_smoothing: float = float(os.environ.get("AVATAR_LIP_SMOOTHING", "1.2"))
+    # Desactivado: con sigma 1,2 la modulación silábica de la boca (3-8 Hz) caía del 16 % al 5 %
+    # (MuseTalk: 16 %) y la articulación se veía "mascada", aunque el recorrido apenas cambiara.
+    lip_smoothing: float = float(os.environ.get("AVATAR_LIP_SMOOTHING", "0.0"))
     # Adelanto del movimiento respecto al audio, en ms (Ditto entrega la boca con retraso).
     audio_lead_ms: float = float(os.environ.get("AVATAR_AUDIO_LEAD_MS", "120"))
+    # Peso de la guía (classifier-free guidance) del LMDM de Ditto: cuánto obedece al audio.
+    # Ditto usa 2; con 3 la modulación silábica sube del 13 % al 16 % y la boca abre algo más.
+    guidance: float = float(os.environ.get("AVATAR_GUIDANCE", "3.0"))
     seed: int = 0
     # Elevación del labio superior (fracción de la apertura de la boca), solo con MuseTalk: este
     # mueve sobre todo mandíbula y labio inferior (medido: superior ~8,8 px de recorrido frente a
     # ~17 px del inferior; con 0,6 el superior pasa a ~11,9 px sin deformar el bigote).
     upper_lip_lift: float = float(os.environ.get("AVATAR_UPPER_LIP_LIFT", "0.6"))
-    # Amplificación de los labios de JoyVASA (solo con lip_sync="joyvasa").
-    lip_scale: float = 1.0
+    # Amplificación del movimiento de los labios respecto a la boca en reposo (1 = tal cual).
+    lip_scale: float = float(os.environ.get("AVATAR_LIP_SCALE", "1.0"))
     crf: int = 18
 
 
@@ -591,11 +594,13 @@ class AvatarEngine:
             raise AvatarError("El audio está vacío o es demasiado corto.")
         frame_count = max(1, math.ceil(audio_duration * settings.fps))
         report("Generando el movimiento a partir del audio", 0.05)
+        ditto.audio2motion.lmdm.model.guidance_weight = settings.guidance
         sequence = ditto.motion_sequence(
             source_info, str(audio_path), seed=settings.seed,
             progress=lambda fraction: report("Generando el movimiento a partir del audio", 0.05 + 0.1 * fraction),
         )
         sequence = DittoMotion.smooth(sequence, settings.pose_smoothing, settings.lip_smoothing)
+        sequence = DittoMotion.scale_lips(sequence, settings.lip_scale)
         sequence = DittoMotion.resample(sequence, settings.fps, frame_count, settings.audio_lead_ms)
         driving = ditto.driving_frames(sequence)
         ditto.setup_stitch(source_info, frame_count)

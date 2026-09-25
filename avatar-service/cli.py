@@ -29,6 +29,8 @@ def main():
                         help="Solo con Ditto: suavizado temporal de los labios (sigma en fotogramas a 25 fps).")
     parser.add_argument("--audio-lead-ms", type=float, default=None,
                         help="Solo con Ditto: adelanto del movimiento respecto al audio en ms (120 por defecto).")
+    parser.add_argument("--guidance", type=float, default=None,
+                        help="Solo con Ditto: peso de la guía del modelo de movimiento (2 por defecto).")
     parser.add_argument("--lip-scale", type=float, default=1.0, help="Amplificación de los labios (1 = JoyVASA original).")
     parser.add_argument("--expression-scale", type=float, default=0.6, help="Intensidad de ojos y cejas (1 = JoyVASA original).")
     parser.add_argument("--debug-crop", action="store_true", help="Guarda el recorte facial y los puntos detectados junto al vídeo.")
@@ -75,7 +77,8 @@ def main():
                        pose_smoothing=RenderSettings().pose_smoothing if args.pose_smoothing is None else args.pose_smoothing,
                        seed=args.seed,
                        lip_smoothing=RenderSettings().lip_smoothing if args.lip_smoothing is None else args.lip_smoothing,
-                       audio_lead_ms=RenderSettings().audio_lead_ms if args.audio_lead_ms is None else args.audio_lead_ms),
+                       audio_lead_ms=RenderSettings().audio_lead_ms if args.audio_lead_ms is None else args.audio_lead_ms,
+                       guidance=RenderSettings().guidance if args.guidance is None else args.guidance),
         progress=progress,
     )
     elapsed = time.perf_counter() - started
